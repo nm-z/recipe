@@ -469,6 +469,315 @@ end
 # ==== BUNDLE ====
 @sec BUNDLE begin
 # recipe.rs 5751-6893 (mod bundle): .ogdl save/load/restore, artifact key, run_infer. Budget 32,000. Parity: bundle bytes.
+# Uses QUANT decompress(::StorageFormat, bytes::Vector{UInt8}, codebook::Vector{Float64}, count) → Vector{Float64},
+# GRAPH refresh_storage (encode_graph_storage). Rust FromStr/from_utf8/io::Error texts are replicated for error parity.
+const H = "recipe-native-model"
+# Rust io::Error Display
+oe(e) = (n = e isa SystemError ? e.errnum : e isa Base.IOError ? -e.code : 0; n > 0 ? "$(Libc.strerror(n)) (os error $n)" : sprint(showerror, e))
+# Rust unsigned FromStr (T = Int stands for usize), f64 FromStr; errors read "invalid <role>: <ParseError>"
+function pu(s, ::Type{T}, r) where {T}
+	isempty(s) && err("invalid $r: cannot parse integer from empty string")
+	t = s[1] == '+' && ncodeunits(s) > 1 ? SubString(s, 2) : s
+	all(c -> '0' <= c <= '9', t) || err("invalid $r: invalid digit found in string")
+	v = tryparse(T, t); v === nothing ? err("invalid $r: number too large to fit in target type") : v
+end
+const FRX = r"^[+-]?(?:inf|infinity|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:e[+-]?[0-9]+)?)$"i
+# Julia rejects literals that round to 0 or ±Inf; Rust returns them
+pu(s, ::Type{Float64}, r) = isempty(s) ? err("invalid $r: cannot parse float from empty string") :
+	occursin(FRX, s) ? (x = tryparse(Float64, s); x === nothing && (x = Float64(parse(BigFloat, s))); isnan(x) && s[1] == '-' ? -NaN : x) :
+	err("invalid $r: invalid float literal")
+va(x, T, r) = x === nothing ? err("$r is absent") : pu(x, T, r)
+vs(x, T, r) = T[pu(v, T, r) for v in split(x)]
+function unhex(v, r)
+	require(iseven(ncodeunits(v)), "$r has an odd hexadecimal width")
+	try return hex2bytes(v) catch end
+	b = codeunits(v)
+	map(1:2:length(b)) do i
+		h = String(b[i:i+1]); occursin(r"^\+?[0-9a-fA-F]+$", h) ? parse(UInt8, lstrip(h, '+'); base=16) : err("invalid $r: invalid digit found in string")
+	end
+end
+"Rust from_utf8 error: (valid_up_to, error_len or nothing)."
+function u8e(b)
+	i, n = 1, length(b)
+	while i <= n
+		c = b[i]; c < 0x80 && (i += 1; continue)
+		w = 0xc2 <= c <= 0xdf ? 2 : 0xe0 <= c <= 0xef ? 3 : 0xf0 <= c <= 0xf4 ? 4 : 0
+		w == 0 && return (i - 1, 1)
+		lo, hi = c == 0xe0 ? (0xa0, 0xbf) : c == 0xed ? (0x80, 0x9f) : c == 0xf0 ? (0x90, 0xbf) : c == 0xf4 ? (0x80, 0x8f) : (0x80, 0xbf)
+		for k in 1:w-1
+			i + k > n && return (i - 1, nothing)
+			x = b[i+k]; (k == 1 ? lo <= x <= hi : 0x80 <= x <= 0xbf) || return (i - 1, k)
+		end
+		i += w
+	end
+end
+function untext(v, r)
+	b = unhex(v, r); s = String(copy(b)); isvalid(s) && return s
+	u, l = u8e(b)
+	err("invalid $r: " * (l === nothing ? "incomplete utf-8 byte sequence from index $u" : "invalid utf-8 sequence of $l bytes from index $u"))
+end
+"Rust split_once(c).unwrap_or((s, \"\"))"
+sp1(s, c) = (x = split(s, c; limit=2); (x[1], get(x, 2, "")))
+bv(v, r) = v == "0" ? false : v == "1" ? true : err("invalid $r")
+J(v, d=' ') = join((x isa AbstractFloat ? fmtd(x) : string(x) for x in v), d)
+
+# ---- model text ----
+act(v) = v <= 15 ? Activation(v) : err("invalid activation $v")
+rt(r) = r.kind == :layer ? "layer,$(r.a)" : r.kind == :conv ? "conv,$(r.a),$(r.b)" : "activation,$(Int(r.act))"
+function rp(v)
+	f = split(v, ','); g(k) = get(f, k, nothing)
+	f[1] == "layer" ? Residual(:layer, va(g(2), Int, "residual layer width"), 0, ALinear) :
+	f[1] == "conv" ? Residual(:conv, va(g(2), Int, "residual filters"), va(g(3), Int, "residual kernel"), ALinear) :
+	f[1] == "activation" ? Residual(:activation, 0, 0, act(va(g(2), UInt8, "residual activation"))) : err("invalid residual $(fmts(v))")
+end
+const OT = ((:layer, "layer", "layer width"), (:pool, "pool", "pool size"), (:attention, "attn", "attention heads"), (:rnn, "rnn", "RNN width"),
+	(:gru, "gru", "GRU width"), (:lstm, "lstm", "LSTM width"), (:perceptron, "perc", "perceptron width"))
+const OK, ON = Dict(v => (k, d) for (k, v, d) in OT), Dict(k => v for (k, v) in OT)
+ot(o) = (k = o.kind; k == :conv ? "conv,$(o.a),$(o.b)" : k == :estimator ? "estimator,$(o.est.name),$(o.est.param)" :
+	k == :residual ? "residual," * join(rt.(o.parts), ';') : k == :moe ? "moe,$(o.a)," * join(rt.(o.parts), ';') : "$(ON[k]),$(o.a)")
+const EST = Dict("kmeans" => (fit_kmeans, cluster_estimator), "knn" => (fit_knn, neighbor_estimator), "svm" => (fit_svm, valid_estimator),
+	"forest" => (fit_forest, positive_estimator), "bayes" => (fit_bayes, valid_estimator), "cbst" => (fit_catboost, valid_estimator),
+	"xgbst" => (fit_xgboost, valid_estimator), "lgbm" => (fit_lightgbm, valid_estimator))
+est(n, p) = haskey(EST, n) ? Estimator(EST[n]..., p, String(n)) : err("invalid estimator $(fmts(n))")
+function opn(v)
+	n, r = sp1(v, ','); f = split(r, ','); g(k) = get(f, k, nothing)
+	haskey(OK, n) && return Operation(OK[n][1], va(r, Int, OK[n][2]))
+	n == "conv" ? Operation(:conv, va(g(1), Int, "convolution filters"), va(g(2), Int, "convolution kernel")) :
+	n == "estimator" ? (p = va(g(2), Int, "estimator parameter"); Operation(:estimator, 0, 0, est(f[1], p), Residual[])) :
+	n == "residual" ? Operation(:residual, 0, 0, nothing, isempty(r) ? Residual[] : rp.(split(r, ';'))) :
+	n == "moe" ? (t = sp1(r, ','); Operation(:moe, va(t[1], Int, "MoE top-k"), 0, nothing, Residual[rp(s) for s in split(t[2], ';') if !isempty(s)])) :
+	err("invalid model operation $(fmts(n))")
+end
+bt(b) = "$(ot(b.operation))|$(Int(b.activation))|$(b.normalization === nothing ? 0 : Int(b.normalization) + 1)|$(b.quantization)|$(Int(b.profile))"
+function blk(v)
+	f = split(v, '|'); require(length(f) == 5, "semantic model block has the wrong width")
+	z = va(f[3], UInt8, "block normalization")
+	z > 2 && err("invalid block normalization")
+	Block(opn(f[1]), act(va(f[2], UInt8, "block activation")), z == 0 ? nothing : BlockNormalization(z - 1),
+		va(f[4], UInt16, "block quantization"), bv(f[5], "block quantization profile"))
+end
+mt(m) = bt.(m._blocks)
+same_model(a, b) = a._loss.c == b._loss.c && a._quantization == b._quantization && mt(a) == mt(b)
+
+# ---- semantic graphs ----
+raw_weight(v) = StoredWeight(StorageFormat(0), length(v), collect(reinterpret(UInt8, v)), Float64[], copy(v))
+function semantic_graph(s::StoredGraph)
+	g = s.graph; ts = StoredWeight[]; ps = PredictorProgram[]
+	for (i, n) in enumerate(g.nodes)
+		n.parameters == 0 && continue
+		n.offset + n.parameters <= length(g.parameters) || err("model parameter span is invalid")
+		e = get(g.stored, i, nothing); e === nothing && (e = raw_weight(g.parameters[n.offset+1:n.offset+n.parameters]))
+		require(e.count == n.parameters && length(e.arithmetic) == n.parameters, "model tensor $(i - 1) has the wrong shape")
+		push!(ts, e)
+	end
+	for n in g.nodes
+		n.op == PPredictor || continue
+		o, c = n.program_offset, n.program_offset + 2n.program_count
+		c <= length(g.programs) || err("fitted estimator program span is invalid")
+		push!(ps, PredictorProgram(g.programs[o+1:c], rs(Int, max(n.argument[1], 0.0)), rs(Int, max(n.argument[2], 0.0)), zeros(n.parameters)))
+	end
+	SemanticGraph(s.model, s.precision, g.input, g.output, copy(s.inputs), copy(s.outputs), ts, ps, copy(g.frozen), deepcopy(g.state),
+		copy(s.norm_mean), copy(s.norm_scale), s.target_min, s.target_span, copy(s.bn_stats), s.artifact)
+end
+function prec(v)
+	f = split(v); require(length(f) == 5, "arithmetic format has the wrong width")
+	x = ntuple(k -> pu(f[k+1], UInt8, ("arithmetic bits", "arithmetic exponent", "arithmetic mantissa", "storage mantissa")[k]), 4)
+	c = saved(f[1], x); c === nothing ? err("saved arithmetic format $(f[1]) $(join(x, ' ')) is unavailable") : c
+end
+mutable struct SB
+	m::Union{Nothing,Tuple{UInt8,UInt16}}; bl::Vector{Block}; i::Vector{String}; o::Vector{String}; is::Union{Nothing,Shape}; os::Union{Nothing,Shape}
+	p::Union{Nothing,Compute}; t::Vector{StoredWeight}; pr::Vector{PredictorProgram}; fz::Vector{UInt8}; st::TrainingState
+	nm::Vector{Float64}; ns::Vector{Float64}; tmin::Float64; tsp::Float64; bn::Vector{Float64}; a::String
+end
+SB() = SB(nothing, Block[], String[], String[], nothing, nothing, nothing, StoredWeight[], PredictorProgram[], UInt8[], TrainingState(), Float64[], Float64[], 0.0, 0.0, Float64[], "")
+function finish(b::SB)
+	b.is === nothing && err("semantic model has no input shape"); b.os === nothing && err("semantic model has no output shape")
+	b.m === nothing && err("semantic model is absent")
+	require(!isempty(b.bl), "semantic model has no blocks")
+	require(b.m[1] in (0, 1, 2, 3, 4, 6), "saved model loss $(b.m[1]) is unavailable")
+	m = Model(b.bl, LossFunction(b.m[1]), b.m[2])
+	require(length(b.i) == elements(b.is), "semantic model input schema has the wrong width")
+	require(length(b.o) == elements(b.os), "semantic model output schema has the wrong width")
+	require(length(b.nm) == length(b.ns) && (isempty(b.nm) || length(b.nm) == length(b.i)), "semantic model normalization stats have the wrong width")
+	require(!isempty(b.a), "native artifact identity is absent")
+	require(length(b.fz) == sum((t.count for t in b.t); init=0), "semantic model frozen weights are incomplete")
+	for (n, v) in (("moments", b.st.moments), ("variances", b.st.variances))
+		require(isempty(v) || length(v) == length(b.fz), "semantic model $n are incomplete")
+	end
+	require(length(b.pr) == count(k -> k.operation.kind == :estimator, b.bl), "semantic model fitted estimator programs are incomplete")
+	b.p === nothing && err("semantic model has no arithmetic format")
+	SemanticGraph(m, b.p, b.is, b.os, b.i, b.o, b.t, b.pr, b.fz, b.st, b.nm, b.ns, b.tmin, b.tsp, b.bn, b.a)
+end
+function stored_weight(f, n, cb, x)
+	b = unhex(x, "semantic tensor bytes")
+	c = cb == "-" ? Float64[] : [pu(v, Float64, "semantic codebook value") for v in split(cb, ',')]
+	a = f == 0 ? (require(length(b) == checked_mul(n, 8, "semantic tensor size"), "semantic raw tensor has the wrong size"); collect(reinterpret(Float64, b))) :
+		decompress(StorageFormat(f), b, c, n)
+	StoredWeight(StorageFormat(f), n, b, c, a)
+end
+# builder fields filled from a value list: kind => (field, element type, role); state fields go to b.st
+const VL = Dict("frozen" => (:fz, UInt8, "frozen weight"), "moments" => (:moments, Float64, "Adam moment"), "variances" => (:variances, Float64, "Adam variance"),
+	"best_loss" => (:best_loss, Float64, "best loss"), "trained_samples" => (:trained_samples, UInt64, "trained sample identity"),
+	"norm_mean" => (:nm, Float64, "normalization mean"), "norm_scale" => (:ns, Float64, "normalization scale"), "bn_stats" => (:bn, Float64, "batch normalization statistics"),
+	"epoch" => (:epoch, Int, "epoch"), "training_rows" => (:training_rows, Int, "training rows"), "target_min" => (:tmin, Float64, "target minimum"),
+	"target_span" => (:tsp, Float64, "target span"))
+ext(p) = splitext(basename(p))[2] == ".ogdl"
+function Recipe.load_semantic(p)
+	require(ext(p), "model path requires .ogdl")
+	d = isdir(p) ? err("cannot read $p: Is a directory (os error 21)") : try read(p, String) catch e; err("cannot read $p: $(oe(e))") end
+	isvalid(d) || err("cannot read $p: stream did not contain valid UTF-8")
+	sc, gs, b = nothing, SemanticGraph[], nothing
+	for l in eachsplit(d, '\n')
+		l = strip(l); (isempty(l) || l == H) && continue
+		if l == "schema"
+			require(sc === nothing && b === nothing, "semantic model has more than one schema"); sc = Tuple{String,String}[]; continue
+		elseif l == "graph"
+			require(sc !== nothing, "semantic model has no schema"); b === nothing || push!(gs, finish(b)); b = SB(); continue
+		end
+		k, v = sp1(l, ' ')
+		if b === nothing
+			sc === nothing && err("semantic schema value precedes schema"); push!(sc, (String(k), String(v))); continue
+		end
+		if haskey(VL, k)
+			f, T, r = VL[k]; o = hasfield(TrainingState, f) ? b.st : b
+			setfield!(o, f, fieldtype(typeof(o), f) <: Vector ? vs(v, T, r) : pu(v, T, r))
+		elseif k == "model"
+			f = split(v); require(length(f) == 2, "semantic model header has the wrong width")
+			require(b.m === nothing, "semantic graph has more than one model")
+			b.m = (va(f[1], UInt8, "semantic model loss"), va(f[2], UInt16, "semantic model quantization"))
+		elseif k == "block"
+			b.m === nothing && err("semantic block precedes model"); push!(b.bl, blk(v))
+		elseif k == "arithmetic" b.p = prec(v)
+		elseif k == "in" push!(b.i, untext(v, "model input"))
+		elseif k == "out" push!(b.o, untext(v, "model output"))
+		elseif k == "shape"
+			s = vs(v, Int, "model shape"); require(length(s) == 4, "semantic model shape has the wrong width")
+			b.is, b.os = Shape(s[1], s[2]), Shape(s[3], s[4])
+		elseif k == "tensor"
+			f = split(v); require(length(f) == 4, "semantic tensor has the wrong width")
+			push!(b.t, stored_weight(va(f[1], UInt16, "semantic tensor format"), va(f[2], Int, "semantic tensor count"), f[3], f[4]))
+		elseif k == "predictor"
+			f = vs(v, Float64, "fitted estimator program")
+			require(length(f) >= 3 && iseven(length(f) - 3), "fitted estimator program has the wrong width")
+			sl(x, r) = (j = rs(Int64, x); j >= 0 && x - trunc(x) == 0 ? j : err("invalid fitted estimator $r"))
+			push!(b.pr, (l = sl(f[1], "locals"); s = sl(f[2], "stack"); PredictorProgram(f[4:end], l, s, zeros(sl(f[3], "table width")))))
+		elseif k == "artifact" b.a = untext(v, "native artifact identity")
+		else err("invalid semantic model value: $l")
+		end
+	end
+	b === nothing || push!(gs, finish(b))
+	require(!isempty(gs), "model has no graphs")
+	sc === nothing && err("semantic model has no schema")
+	(sc, gs)
+end
+Recipe.save_semantic(p, sc, gs) = (c = load_config(); save_semantic_graphs(p, sc, [(refresh_storage(s.graph, c); semantic_graph(s)) for s in gs]))
+function Recipe.save_semantic_graphs(p, sc, gs)
+	require(ext(p), "save requires an .ogdl model"); require(!isempty(gs), "model bundle has no graphs")
+	d = IOBuffer(); print(d, H, "\n    schema\n")
+	F(k, v) = print(d, "        ", k, ' ', v, '\n')
+	for (k, v) in sc F(k, v) end
+	for s in gs
+		print(d, "    graph\n"); F("model", "$(s.model._loss.c) $(s.model._quantization)")
+		for b in s.model._blocks F("block", bt(b)) end
+		for n in s.inputs F("in", bytes2hex(codeunits(n))) end
+		for n in s.outputs F("out", bytes2hex(codeunits(n))) end
+		f, v = saved_fields(s.precision); F("arithmetic", "$f $(J(v))")
+		F("shape", "$(s.input.channels) $(s.input.length) $(s.output.channels) $(s.output.length)")
+		for t in s.tensors F("tensor", "$(t.format.code) $(t.count) $(isempty(t.codebook) ? "-" : J(t.codebook, ',')) $(bytes2hex(t.bytes))") end
+		for q in s.predictors F("predictor", "$(q.locals) $(q.stack) $(length(q.table)) $(J(q.code))") end
+		t = s.state
+		for (k, v) in (("frozen", J(s.frozen)), ("moments", J(t.moments)), ("variances", J(t.variances)), ("best_loss", J(t.best_loss)),
+			("epoch", t.epoch), ("training_rows", t.training_rows), ("trained_samples", J(t.trained_samples)), ("norm_mean", J(s.norm_mean)), ("norm_scale", J(s.norm_scale)))
+			F(k, v)
+		end
+		s.target_span != 0 && (F("target_min", fmtd(s.target_min)); F("target_span", fmtd(s.target_span)))
+		isempty(s.bn_stats) || F("bn_stats", J(s.bn_stats))
+		require(!isempty(s.artifact), "native artifact identity is absent"); F("artifact", bytes2hex(codeunits(s.artifact)))
+	end
+	# publish atomically through an exclusively created temporary sibling
+	n, Fs, h = 0, Base.Filesystem, nothing
+	t = ""
+	while h === nothing
+		t = "$(splitext(p)[1]).ogdl.$(getpid()).$n.tmp"
+		h = try Fs.open(t, Fs.JL_O_WRONLY | Fs.JL_O_CREAT | Fs.JL_O_EXCL, 0o666) catch e
+			e isa Base.IOError && e.code == Base.UV_EEXIST ? (n += 1; nothing) : err("cannot write $t: $(oe(e))")
+		end
+	end
+	try
+		try write(h, take!(d)); r = ccall(:fsync, Cint, (Cint,), h.handle); r == 0 || throw(SystemError("fsync", Libc.errno())); close(h)
+		catch e; close(h); err("cannot write $t: $(oe(e))") end
+		try Fs.rename(t, p) catch e; err("cannot publish $p: $(oe(e))") end
+	catch
+		rm(t; force=true); rethrow()
+	end
+	nothing
+end
+same_structure(a, b) = a.precision == b.precision && a.input == b.input && a.output == b.output && a.inputs == b.inputs && a.outputs == b.outputs &&
+	same_model(a.model, b.model) && length(a.tensors) == length(b.tensors) && all(x.format.code == y.format.code && x.count == y.count for (x, y) in zip(a.tensors, b.tensors)) &&
+	length(a.frozen) == length(b.frozen)
+"Rust `{:?}` of Compute."
+cdbg(c) = (L(l) = "FloatLayout { sign: $(l.sign), exp: $(l.exp), man: $(l.man) }";
+	c.kind == :int ? "Int(IntFormat { bits: $(c.i.bits) })" : "$(uppercasefirst(string(c.kind)))(FloatFormat { arithmetic: $(L(c.f.arithmetic)), storage: $(L(c.f.storage)) })")
+function Recipe.bundle_artifact_key(m, sc, pr, g, tg)
+	d = IOBuffer(); print(d, H); for (k, v) in sc print(d, k, ':', v, ';') end
+	print(d, tg, "precision:", cdbg(pr), ";loss:", m._loss.c, ";quant:", m._quantization, ";blocks:", join(mt(m), '/'), ';')
+	for n in g.nodes print(d, "node:", n.offset, ':', n.parameters, ':', reinterpret(UInt64, n.argument[9]), ':', elements(n.output), ';') end
+	h = 0xcbf29ce484222325; for c in take!(d) h = (h ⊻ c) * 0x100000001b3 end
+	"recipe-native-" * string(h; base=16, pad=16)
+end
+function Recipe.restore(p, sc, gs, ids)
+	ispath(p) || return save_semantic(p, sc, gs)
+	ss, st = load_semantic(p); cu = semantic_graph.(gs)
+	if ss == sc && length(st) == length(cu) && all(same_structure(a, b) for (a, b) in zip(st, cu))
+		for (c, s) in zip(gs, st)
+			sb, cb = s.state.training_rows, c.graph.state.training_rows
+			if sb != 0
+				require(!isempty(s.state.trained_samples), "resume rejected: saved model has no training membership identity")
+				require(cb <= length(ids), "current training membership is incomplete")
+				t = Set(s.state.trained_samples); o = count(in(t), @view ids[cb+1:end])
+				require(o == 0, "resume rejected: $o evaluation samples were previously trained, current boundary is $cb and saved boundary was $sb")
+			end
+			q(a, b) = length(a) == length(b) && all(map(===, a, b))
+			require(q(c.norm_mean, s.norm_mean) && q(c.norm_scale, s.norm_scale) && c.target_min === s.target_min && c.target_span === s.target_span,
+				"resume rejected: fitted preprocessing differs, current boundary is $cb and saved boundary was $sb")
+		end
+		for (c, s) in zip(gs, st)
+			g = c.graph; r = g.state.training_rows; k = 0
+			for (i, n) in enumerate(g.nodes)
+				n.parameters == 0 && continue
+				k += 1; k > length(s.tensors) && err("saved semantic tensor is absent")
+				e = s.tensors[k]; require(e.count == n.parameters, "saved semantic tensor has the wrong shape")
+				g.parameters[n.offset+1:n.offset+n.parameters] = e.arithmetic
+				i <= length(g.stored) && (g.stored[i] = e.format.code != 0 ? e : nothing)
+			end
+			require(k == length(s.tensors), "saved semantic tensors are incomplete")
+			g.state = s.state; g.frozen = s.frozen; g.state.training_rows = r
+		end
+		return
+	end
+	print(stderr, "mismatch: overwrite $p? Y/n "); flush(stderr)
+	a = try readline(stdin; keep=true) catch e; err("cannot read answer: $(oe(e))") end
+	require(!isempty(a) && strip(a) in ("", "y", "Y"), "model mismatch not overwritten")
+	save_semantic(p, sc, gs)
+end
+"run_infer(path, input, forward(::SemanticGraph, samples) → Vector{Float64})"
+function Recipe.run_infer(p, x, fw)
+	_, gs = load_semantic(p); f = gs[1]
+	require(length(x) == length(f.inputs), "model input expected $(length(f.inputs)) values, received $(length(x))")
+	v = Dict{String,Float64}(zip(f.inputs, x)); r = Float64[]
+	for s in gs
+		y = Float64[haskey(v, n) ? v[n] : err("input $(fmts(n)) is absent") for n in s.inputs]
+		if !isempty(s.norm_mean)
+			require(length(s.norm_mean) == length(y), "model normalization expected $(length(s.norm_mean)) values, received $(length(y))")
+			y = [(a - m) / c for (a, m, c) in zip(y, s.norm_mean, s.norm_scale)]
+		end
+		r = collect(Float64, fw(s, y))
+		s.target_span > 0 && (r = [s.target_min + s.target_span * logistic(z) for z in r])
+		require(length(r) == length(s.outputs), "model output expected $(length(s.outputs)) values, received $(length(r))")
+		for (n, z) in zip(s.outputs, r) v[n] = z end
+	end
+	r
+end
 end
 
 # ==== QUANT ====
