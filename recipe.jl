@@ -463,7 +463,230 @@ end
 
 # ==== TOOL ====
 @sec TOOL begin
-# recipe.rs 5235-5606, 14872-15439: artifact cache, clang/llc/ld calls (no CPU), compile_model, tiles, geometry. Budget 26,000. Parity: commands, tiles.
+# recipe.rs 5235-5606, 14872-15439: artifact cache, clang/llc calls (no CPU), compile_model, tiles, geometry. Budget 26,000. Parity: commands, tiles.
+# Calls stubs validate_target artifact_extension native_model_ir emit_model loss_name narrow integer_argument, and
+# layout_storage(::NativeModelIr) for Rust NativeModelIr::storage. u32 math runs in Int128, usize math in UInt64 (release
+# build: next_multiple_of wraps); u32 results are UInt32. Resources = (shared, max_block) and Geometry = (groups, block)
+# NamedTuples; Rust Geometry::threads is Recipe.TOOL.gthreads. compile_native_artifact(…; x) takes the runner (Cmd, role, key) → stderr.
+const SERIAL = Threads.Atomic{Int}(0)
+W(x) = Int128(x)
+U(x) = UInt64(x)
+u(x, m) = x > 0xffffffff ? err(m) : Int(x)
+cm(a, b, r) = ((p, o) = Base.mul_with_overflow(U(a), U(b)); o ? err("$r overflows") : p)
+ca(a, b, r) = ((p, o) = Base.add_with_overflow(U(a), U(b)); o ? err("$r overflows") : p)
+nw(v, r) = narrow(Int(min(U(v), U(typemax(Int)))), r)
+ioe(e) = e isa Base.IOError ? (c = -e.code; "$(Libc.strerror(c)) (os error $c)") : e isa SystemError ? "$(Libc.strerror(e.errnum)) (os error $(e.errnum))" : sprint(showerror, e)
+io(f, m) = try f() catch e; e isa RecipeError ? rethrow() : err("$m: $(ioe(e))") end
+mr(k, m) = (v = get(MR, k, nothing); v === nothing ? err(m) : string(v))
+
+function Recipe.native_artifact_directory(k)
+	require(!isempty(k) && k ∉ (".", "..") && !occursin('/', k) && !occursin('\\', k), "native artifact key is not a single path component")
+	h = get(ENV, "HOME", nothing); h === nothing && err("home directory is absent")
+	joinpath(h, ".cache", "recipe", "native", k)
+end
+"FNV-1a over (u64 LE length, bytes) of the version tag, the target label and the IR."
+function Recipe.native_artifact_key(t::BackendTarget, ir)
+	h = 0xcbf29ce484222325
+	for p in ("recipe-native-v2", t.architecture, ir), b in Iterators.flatten((reinterpret(UInt8, [htol(U(ncodeunits(p)))]), codeunits(p)))
+		h = (h ⊻ b) * 0x00000100000001b3
+	end
+	"recipe-native-" * string(h, base=16, pad=16)
+end
+"Rust `{:?}` of a Command."
+cq(c::Cmd) = join(fmts.(c.exec), ' ')
+lossy(b) = (s = String(b); isvalid(s) ? s : map(c -> isvalid(c) ? c : '�', s))
+"Run a compiler; return its trimmed diagnostic stream (resource remarks arrive there)."
+function ncmd(c::Cmd, r, k)
+	debug("native compiler key=$k role=$r command=$(cq(c))")
+	e = IOBuffer()
+	p = try run(pipeline(ignorestatus(c); stdin=devnull, stdout=devnull, stderr=e)) catch x; err("cannot start $r: $(ioe(x))") end
+	d = String(strip(lossy(take!(e))))
+	success(p) ? d : err("$r failed: $d")
+end
+"`occupancy` is resident waves per SIMD; zero means the cooperative grid could never complete."
+mutable struct KernelResources; name::String; registers::UInt32; scalars::UInt32; occupancy::UInt32 end
+const KF = Dict("VGPRs" => :registers, "TotalSGPRs" => :scalars, "Occupancy [waves/SIMD]" => :occupancy)
+pu(v) = UInt32(occursin(r"^\+?[0-9]+\z", v) ? something(tryparse(UInt32, lstrip(v, '+')), 0) : 0)
+"Parse `-Rpass-analysis=kernel-resource-usage` remarks; unrecognised text yields no entries."
+function Recipe.kernel_resources(d::AbstractString)
+	f = KernelResources[]
+	for l in split(d, '\n')
+		l = chopsuffix(l, "\r"); occursin("kernel-resource-usage", l) || continue
+		i = findlast(" [-", l); b = i === nothing ? l : l[1:prevind(l, first(i))]
+		j = findlast(':', b); j === nothing && continue
+		h, v = b[1:prevind(b, j)], String(strip(b[j+1:end])); a = strip(h[something(findlast(':', h), 0)+1:end])
+		a == "Function Name" ? push!(f, KernelResources(v, 0, 0, 0)) :
+			(s = get(KF, a, nothing)) !== nothing && !isempty(f) && setfield!(f[end], s, pu(v))
+	end
+	f
+end
+Recipe.native_amd_compiler() = mr("hsa-compiler", "AMD native compiler is unavailable")
+Recipe.native_nvidia_compiler() = mr("nvidia-compiler", "NVIDIA native compiler is unavailable")
+Recipe.native_amd_library(n) = mr("hsa-$n-library", "AMD native $n library is unavailable")
+const LB = ("-Xclang", "-mlink-builtin-bitcode", "-Xclang")
+function Recipe.compile_native_artifact(t::BackendTarget, s, o, bc, k; x=ncmd)
+	a = t.architecture
+	if t.backend == Amd
+		# The resource remarks are the only route to the kernel's register allocation, which decides residency.
+		c = [native_amd_compiler(), "-target", "amdgcn-amd-amdhsa", "-mcpu=$a", "-O3", "-nogpulib", "-Rpass-analysis=kernel-resource-usage"]
+		for n in ("device", "clock", "abi", "finite", "math") push!(c, LB..., native_amd_library(n)) end
+		d = mr("hsa-device-library-directory", "AMD native device library directory is unavailable")
+		push!(c, LB..., joinpath(d, "oclc_isa_version_$(replace(a, r"^(gfx)*" => "")).bc"), s, "-o", o)
+		return kernel_resources(x(Cmd(c), "AMD LLVM IR compiler", k))
+	end
+	c = native_nvidia_compiler(); v = mr("nvidia-device-library", "NVIDIA native device library is unavailable")
+	bc === nothing && err("NVIDIA bitcode path is absent")
+	p = "+" * mr("nvidia-ptx", "NVIDIA PTX version is unavailable")
+	x(Cmd([c, "-target", "nvptx64-nvidia-cuda", "-march=$a", "-O2", "-emit-llvm", "-c", "-x", "ir", s, LB..., v, "-o", bc]), "NVIDIA LLVM IR compiler", k)
+	# clang stamps its newest PTX ISA, so llc pins the configured one and every driver at or above it JIT-loads the artifact.
+	g = mr("nvidia-ptx-generator", "NVIDIA PTX generator is unavailable")
+	x(Cmd([g, "-march=nvptx64", "-mcpu=$a", "-mattr=$p", "-O2", bc, "-o", o]), "NVIDIA PTX generator", k)
+	io(() -> write(o, push!(read(o), 0x00)), "cannot terminate native PTX artifact")
+	KernelResources[]
+end
+function Recipe.compile_model(t::BackendTarget, g, p::Compute, l, rows, sc)
+	validate_target(t)
+	m = native_model_ir(g, rows, p, sc); a = t.architecture; e = artifact_extension(t)
+	x = t.backend == Amd && m.schedule.matrix ? (startswith(a, "gfx11") ? Gfx11 : startswith(a, "gfx12") ? Gfx12 : nothing) : nothing
+	ir = emit_model(m, t.backend, x, l)
+	k = native_artifact_key(t, ir); d = native_artifact_directory(k)
+	io(() -> mkpath(d), "cannot create native artifact directory")
+	f = joinpath(d, "artifact.$e"); h = isfile(f)
+	debug("native artifact key=$k target=$a arithmetic=$(label(m.precision.model)) loss=$(loss_name(l)) rows=$rows cache=$(h ? "hit" : "miss") path=$f")
+	if !h
+		st = joinpath(d, ".recipe-native-$(getpid())-$(Threads.atomic_add!(SERIAL, 1))")
+		s, o, b = "$st.ll", "$st.$e", t.backend == Nvidia ? "$st.bc" : nothing
+		try
+			io(() -> write(s, ir), "cannot write native LLVM IR")
+			debug("native source key=$k path=$s")
+			# The cached artifact hides the compiler's view of the kernel, so residency is checked only here.
+			for r in compile_native_artifact(t, s, o, b, k)
+				debug("native kernel $(r.name) registers=$(r.registers) scalars=$(r.scalars) occupancy=$(r.occupancy) waves per SIMD")
+				require(r.occupancy != 0, "native kernel $(r.name) cannot be resident at any workgroup width")
+			end
+			io(() -> Base.Filesystem.rename(o, f), "cannot publish native artifact $f")
+		finally
+			for q in (s, o, b) q === nothing || try rm(q; force=true) catch end end
+		end
+	end
+	r = io(() -> read(f), "cannot read native artifact $f")
+	require(!isempty(r), "native artifact $f is empty")
+	NativeArtifact(t, m.layout, m.precision, r, f, layout_storage(m))
+end
+
+function shape1(n::Node, rows)
+	I, O = n.input, n.output
+	if n.op == PContraction
+		sp = max(Int(integer_argument(n.argument[1], "native contraction kernel")), 1)
+		w = cm(I.channels, sp, "native contraction window"); r = cm(rows, O.length, "native contraction output rows")
+		d = ((r, O.channels, w), (w, O.channels, r), (cm(rows, I.length, "native contraction input rows"), I.channels,
+			cm(O.channels, sp, "native contraction previous terms")), n.parameters)
+	elseif n.op == PScan
+		r = cm(rows, I.length, "native scan projection rows")
+		d = ((r, O.channels, I.channels), (I.channels, O.channels, r), (r, I.channels, O.channels),
+			cm(I.channels, O.channels, "native scan projection parameters"))
+	else
+		return nothing
+	end
+	e(x, s) = Tile((nw(v, "native $s contraction $c") % UInt32 for (v, c) in zip(x, "MNK"))...)
+	NativeContractionShapes(e(d[1], "forward"), e(d[2], "gradient"), e(d[3], "previous"), d[4] % Int)
+end
+Recipe.native_contraction_shapes(g, rows) = Union{Nothing,NativeContractionShapes}[shape1(n, rows) for n in g.nodes]
+function Recipe.native_attention_shared_values(e::Tile, full::Bool)
+	m, n, k = W(e.m), W(e.n), W(e.k)
+	q = u(m * k, "native attention query tile overflows"); y = u(n * k, "native attention key tile overflows")
+	p = u(m * n, "native attention pair tile overflows"); s = "native attention shared values overflow"
+	f, a, b, x = u(2q + 2y + 2p + 3m, s), u(3q + 2y + 2p + m, s), u(2q + 4y + 2p + m, s), u(4q + 2m * m + m, s)
+	UInt32(max(f, a, b, full ? x : 0))
+end
+function Recipe.native_attention_tile(l, w, sv, qt)
+	require(l != 0 && w != 0 && sv != 0 && qt != 0, "native attention tile inputs are empty")
+	l, w, sv = Int(l), Int(w), Int(sv); q = min(l, Int(qt))
+	while true
+		v = W(q) * w; ff, fk, gf, gk, kf, kk = 2v + 3q, 2(w + q), 3v + q, 2w + 2q, 2v + q, 4w + 2q
+		u(max(ff, fk, gf, gk, kf, kk), "native attention tile overflows")
+		y = min(max(sv - ff, 0) ÷ fk, max(sv - gf, 0) ÷ gk, max(sv - kf, 0) ÷ kk)
+		x = u(4v + 2W(q)^2 + q, "native attention matrix tile overflows")
+		y != 0 && (q != l || x <= sv) && return Tile(q, min(y, l), w)
+		(q -= 1) == 0 && err("native attention tile does not fit the device")
+	end
+end
+function att1(n::Node, sv, qt)
+	n.op != PAttention && return nothing
+	h = integer_argument(n.argument[1], "native attention heads") % UInt32
+	c = narrow(n.output.channels, "native attention channels") % UInt32; l = narrow(n.output.length, "native attention length") % UInt32
+	require(c % h == 0, "native attention head partition is invalid")
+	native_attention_tile(l, c ÷ h, sv, qt)
+end
+Recipe.native_attention_tiles(g, sv, qt) = Union{Nothing,Tile}[att1(n, sv, qt) for n in g.nodes]
+Recipe.native_tiles(t, w, r) = ((t, w) = (U(t), U(w)); require(t != 0 && w != 0, "$r is empty"); v = ca(t ÷ w, t % w != 0, r); v > typemax(Int) ? v : Int(v))
+"Chunk partials the k lanes of one job exchange, in model-sized elements (state values × ratio) per chunk."
+function Recipe.native_contraction_partial_per_chunk(m, n, rm, rn, b, ra)
+	m, n, rm, rn, b, ra = Int.((m, n, rm, rn, b, ra))
+	o = u(W(max(m ÷ rm, 1)) * max(n ÷ rn, 1), "native contraction lane count overflows")
+	r = u(W(rm) * rn, "native contraction register tile overflows"); P = "native contraction partial region overflows"
+	s = W(min(o, max(b ÷ 2, 1))) * r; c = W(max(n ÷ rn, 1)) * rn; u(s, P); u(c, P); u(s + c, P)
+	UInt32(u((s + c) * ra, P))
+end
+"Staged operands and the chunk partials share local memory; a tile too wide for one chunk narrows M, then N lanes."
+function Recipe.native_contraction_tile(L::Tile, rm, rn, b, sv, fr, ra, mx::Bool)
+	rm, rn, b, sv, fr, ra = Int.((rm, rn, b, sv, fr, ra)); Lm, Ln, Lk = Int(L.m), Int(L.n), Int(L.k)
+	require(rm != 0 && rn != 0 && b != 0 && fr != 0 && ra != 0, "native contraction tile inputs are empty")
+	if mx
+		v = b ÷ 32; require(v != 0, "native matrix contraction has no wave")
+		m = u(W(v) * 16, "native matrix contraction M tile overflows"); n = max(b ÷ 2, 32)
+		o = sv ÷ u(W(m) + n, "native matrix contraction tile width overflows")
+		k = min(u(W(cld(Lk, fr)) * fr, "native matrix contraction K tile overflows"), o - o % fr)
+		require(k != 0, "native matrix contraction tile does not fit the device")
+		return Tile(m, n, k)
+	end
+	ln = min(cld(Ln, rn), max(isqrt(b), 1)); wm = cld(Lm, rm); lm = min(wm, b ÷ ln)
+	while true
+		m = u(W(lm) * rm, "native contraction M tile overflows"); n = u(W(ln) * rn, "native contraction N tile overflows")
+		sk = sv ÷ u(W(m) + n, "native contraction tile width overflows")
+		o = min(sk, u(W(sv ÷ Int(native_contraction_partial_per_chunk(m, n, rm, rn, b, ra))) * fr, "native contraction partial K overflows"))
+		# Whole chunks per multi-tile walk; a walk staged in one tile keeps its exact length.
+		o >= Lk && return Tile(m, n, Lk)
+		o >= fr && return Tile(m, n, o - o % fr)
+		if lm > 1
+			lm -= 1
+		else
+			ln > 1 || err("native contraction tile does not fit the device"); ln -= 1; lm = min(wm, b ÷ ln)
+		end
+	end
+end
+function Recipe.native_contraction_shared_values(e::Tile, rm, rn, b, fr, ra, mx::Bool)
+	t = W(e.m) + e.n; M = "native contraction shared values overflow"; u(t, M); s = u(t * e.k, M)
+	mx && return UInt32(s)
+	c = cld(Int(e.k), Int(fr)); p = native_contraction_partial_per_chunk(e.m, e.n, rm, rn, b, ra)
+	UInt32(max(s, u(W(c) * p, "native contraction partial region overflows")))
+end
+"Gradient values plus split-K scratch: one row per K partition, rows aligned to NATIVE_SCRATCH_ROW_VALUES."
+function Recipe.native_gradient_values(P, cs)
+	S = U(NATIVE_SCRATCH_ROW_VALUES); a(x) = (x = U(x); x % S == 0 ? x : x + (S - x % S)); z = U(0)
+	for c in cs
+		c === nothing && continue
+		g, h = c.gradient_shape, c.gradient
+		sp = max(min(cld(U(g.k), min(NATIVE_SPLIT_SPAN, NATIVE_MATRIX_SPLIT_SPAN)), NATIVE_K_PARTITIONS), 1)
+		j = cm(native_tiles(g.m, h.m, "native split-K M tiles"), native_tiles(g.n, h.n, "native split-K N tiles"), "native split-K jobs")
+		nw(cm(j, sp, "native split-K tasks"), "native split-K tasks")
+		sp > 1 && (z = max(z, cm(sp, a(c.parameters), "native split-K scratch")))
+	end
+	v = ca(a(P), z, "native gradient and split-K scratch"); nw(v, "native gradient and split-K scratch"); Int(v)
+end
+gthreads(g) = (t = W(g.groups) * g.block; t == 0 || t > 0xffffffff ? err("GPU launch size overflows") : UInt32(t))
+G(c, b) = (groups=UInt32(c), block=UInt32(b))
+function Recipe.geometry(cus, wave, wg, lds, gpc, r)
+	require(wave != 0 && wave <= wg && wave <= r.max_block, "GPU wave exceeds kernel workgroup")
+	w = min(gpc, wg ÷ wave, r.max_block ÷ wave); require(w != 0, "GPU has no resident wave")
+	b = u(W(w) * wave, "GPU workgroup size overflows"); require(r.shared <= lds, "GPU tile exceeds local memory"); G(cus, b)
+end
+function Recipe.amd_resources(cus, wave, wg, lds, ws, r)
+	b = u(W(wave) * ws, "AMD workgroup size overflows")
+	require(wave != 0 && b <= wg && b <= r.max_block && ws != 0, "AMD workgroup geometry is invalid")
+	require(r.shared <= lds, "AMD workgroup exceeds local memory"); G(cus, b)
+end
+Recipe.nvidia_resources(cus, wave, wg, bl, sl, wpc, r) = (require(r.shared <= bl, "Nvidia tile exceeds workgroup shared memory"); geometry(cus, wave, wg, sl, wpc, r))
 end
 
 # ==== BUNDLE ====
