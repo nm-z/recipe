@@ -444,6 +444,189 @@ function encode_feature end; function shuffle_rows end; function zip_entries end
 # ==== PIR ====
 @sec PIR begin
 # recipe.rs 4-1950 (mod program_ir): scalar/predictor/normalize LLVM IR emission. Budget 58,000. Parity: IR text.
+# Opcodes stay Int32 values (ScalarOpcode/PredictorOpcode numbering); EmitError → err with Rust's Display text.
+bad(k, v) = err("$k program has invalid operand $(fmtd(Float64(v)))")
+int(v, k) = isfinite(v) && isinteger(v) && -2.0^31 <= v <= 2.0^31 - 1 ? Int(v) : bad(k, v)
+B(o, t, n, f, a, b) = (println(o, "$n = call $t @recipe.$f($t $a, $t $b)"); n)
+G(o, t, n, a, b) = (println(o, "$n.condition = call i1 @recipe.ogt($t $a, $t $b)\n$n = call $t @recipe.from.u1(i1 $n.condition)"); n)
+const SB, SU = Dict(0 => "add", 3 => "sub", 4 => "mul", 5 => "div"), Dict(6 => "abs", 7 => "exp", 8 => "log", 10 => "sin", 11 => "cos", 12 => "tanh")
+function sparse(c)
+	length(c) % 3 == 0 || err("scalar program has invalid width $(length(c))")
+	[(o = int(c[i], "scalar opcode"); o in 0:15 && o != 9 || err("scalar program has invalid opcode $o"); (o, c[i+1], c[i+2])) for i in 1:3:length(c)]
+end
+sref(v, vs, x) = (i = int(v, "scalar reference"); i == -2 ? x.second : i == -1 ? x.first : 0 <= i < length(vs) ? vs[i+1] : err("scalar program references unavailable value $i"))
+spar(l) = (p = int(l, "scalar parameter"); p < 0 ? bad("scalar parameter", l) : p)
+function Recipe.emit_scalar_forward(c, x::ScalarContext)
+	I = sparse(c); o = IOBuffer(); vs = String[]; t, pt, L = x.value_type, x.pointer_type, x.literal
+	for (k, (op, l, r)) in enumerate(I)
+		n = "%$(x.prefix).scalar.$(k-1)"; S = v -> sref(v, vs, x)
+		push!(vs, op == 1 ? L(l, t) :
+			op == 2 ? (p = spar(l); println(o, "$n.ptr = getelementptr inbounds $t, $pt $(x.weights), i32 $p\n$n = load $t, $pt $n.ptr, align $(x.alignment)"); n) :
+			op == 14 ? S(l) :
+			op == 15 ? (a = S(l); b = S(r); z = L(0.0, t); println(o, "$n.condition = call i1 @recipe.ogt($t $a, $t $z)\n$n = select i1 $n.condition, $t $b, $t $z"); n) :
+			op == 13 ? G(o, t, n, S(l), S(r)) : haskey(SB, op) ? B(o, t, n, SB[op], S(l), S(r)) :
+			(a = S(l); println(o, "$n = call $t @recipe.$(SU[op])($t $a)"); n))
+	end
+	isempty(vs) && err("scalar program has invalid width 0")
+	ScalarForward(String(take!(o)), vs[end])
+end
+function Recipe.emit_scalar_reverse(c, x::ScalarContext, inc)
+	I = sparse(c); o = IOBuffer(); t, L, P = x.value_type, x.literal, x.prefix; vs = String[]; pf = Int[]; n = length(I)
+	for (k, (op, l, r)) in enumerate(I)
+		push!(pf, op == 2 ? spar(l) : -1)
+		push!(vs, op == 1 ? L(l, t) : op == 14 ? sref(l, vs, x) : "%$P.scalar.$(k-1)")
+	end
+	z = L(0.0, t); A = fill(z, n); f = s = z; q = 0; n > 0 && (A[n] = inc)
+	nm(a) = (r = "%$P.$a.$q"; q += 1; r)
+	ad(v, c) = (i = int(v, "scalar reference"); i == -2 ? (s = B(o, t, nm("adjoint"), "add", s, c)) : i == -1 ? (f = B(o, t, nm("adjoint"), "add", f, c)) :
+		0 <= i < n ? (A[i+1] = B(o, t, nm("adjoint"), "add", A[i+1], c)) : err("scalar program references unavailable value $i"))
+	ng(v) = (m = nm("neg"); println(o, "$m = call $t @recipe.neg($t $v)"); m)
+	b(a, f, u, v) = B(o, t, nm(a), f, u, v)
+	w(m, s) = println(o, "$m = $s")
+	for k in n:-1:1
+		op, l, r = I[k]; a = A[k]
+		lf = op in (1, 2) ? "" : sref(l, vs, x)
+		rt = op in (0, 3, 4, 5, 13, 14, 15) ? sref(r, vs, x) : ""
+		if op == 0; ad(l, a); ad(r, a)
+		elseif op == 14; ad(r, a)
+		elseif op == 3; ad(l, a); ad(r, ng(a))
+		elseif op == 4; u = b("mul.left", "mul", a, rt); v = b("mul.right", "mul", a, lf); ad(l, u); ad(r, v)
+		elseif op == 5; u = b("div.left", "div", a, rt); sq = b("div.square", "mul", rt, rt); nu = b("div.numerator", "mul", a, lf); v = ng(b("div.raw", "div", nu, sq)); ad(l, u); ad(r, v)
+		elseif op == 6
+			ne = nm("abs.negative"); po = nm("abs.positive"); w(ne, "call i1 @recipe.olt($t $lf, $t $z)"); w(po, "call i1 @recipe.ogt($t $lf, $t $z)")
+			g = ng(a); u = nm("abs.upper"); w(u, "select i1 $po, $t $a, $t $z"); v = nm("abs.contribution"); w(v, "select i1 $ne, $t $g, $t $u"); ad(l, v)
+		elseif op == 7; ad(l, b("exp", "mul", a, vs[k]))
+		elseif op == 8; ad(l, b("log", "div", a, lf))
+		elseif op == 10; u = nm("sin.cosine"); w(u, "call $t @recipe.cos($t $lf)"); ad(l, b("sin", "mul", a, u))
+		elseif op == 11; u = nm("cos.sine"); w(u, "call $t @recipe.sin($t $lf)"); ad(l, ng(b("cos.raw", "mul", a, u)))
+		elseif op == 12; sq = b("tanh.square", "mul", vs[k], vs[k]); ad(l, b("tanh", "mul", a, b("tanh.base", "sub", L(1.0, t), sq)))
+		elseif op == 15; u = nm("select.condition"); w(u, "call i1 @recipe.ogt($t $lf, $t $z)"); v = nm("select.contribution"); w(v, "select i1 $u, $t $a, $t $z"); ad(r, v)
+		end
+	end
+	pm = Dict{Int,String}()
+	for k in 1:n
+		p = pf[k]; p < 0 || (pm[p] = haskey(pm, p) ? B(o, t, nm("adjoint"), "add", pm[p], A[k]) : A[k])
+	end
+	ScalarReverse(String(take!(o)), f, s, sort!(collect(pm); by=first))
+end
+function Recipe.emit_predictor_forward(c, nl, x::PredictorContext)
+	length(c) % 2 == 0 || err("predictor program has invalid width $(length(c))")
+	I = [(y = int(c[i], "predictor opcode"); 0 <= y <= 13 || err("predictor program has invalid opcode $y"); (y, c[i+1])) for i in 1:2:length(c)]
+	o = IOBuffer(); t, pt, al, L, P, F, W, R, In, Of = x.value_type, x.pointer_type, x.alignment, x.literal, x.prefix, x.features, x.weights, x.row, x.input, x.offset
+	st = String[]; lv = fill(L(0.0, t), nl); q = 0; z = L(0.0, t)
+	nm(a) = (r = "%$P.predictor.$a$q"; q += 1; r)
+	pop() = isempty(st) ? err("predictor program stack underflows") : pop!(st)
+	loc(a) = (i = int(a, "predictor local"); 0 <= i < nl ? i + 1 : err("predictor local $(max(i, 0)) is outside $nl locals"))
+	w(s) = println(o, s)
+	ld(p, s) = "%$p.$s.ptr = getelementptr inbounds $t, $pt $(s == "q" ? In : W), i32 %$p.$s.index\n%$p.$s = load $t, $pt %$p.$s.ptr, align $al"
+	qr(p, j) = "%$p.q.base = mul i32 $R, $F\n%$p.q.index = add i32 %$p.q.base, %$p.$j\n" * ld(p, "q")
+	for (op, a) in I
+		if op == 0
+			f = int(a, "predictor feature"); 0 <= f < F || bad("predictor feature", a)
+			rb = nm("row.base."); ix = nm("feature.index."); pp = nm("feature.ptr."); v = nm("feature.")
+			w("$rb = mul i32 $R, $F\n$ix = add i32 $rb, $f\n$pp = getelementptr inbounds $t, $pt $In, i32 $ix\n$v = load $t, $pt $pp, align $al"); push!(st, v)
+		elseif op == 1; v = nm("row."); w("$v = call $t @recipe.from.u32(i32 $R)"); push!(st, v)
+		elseif op == 2; push!(st, L(a, t))
+		elseif op == 3; push!(st, lv[loc(a)])
+		elseif op == 4; i = loc(a); lv[i] = pop()
+		elseif op == 5; push!(st, isempty(st) ? pop() : st[end])
+		elseif op <= 9; r = pop(); l = pop(); push!(st, B(o, t, nm(""), ("add", "sub", "mul", "div")[op-5], l, r))
+		elseif op == 10; r = pop(); l = pop(); push!(st, G(o, t, nm("greater."), l, r))
+		elseif op == 11
+			no = pop(); ye = pop(); cd = pop(); ct = nm("condition."); v = nm("choose.")
+			w("$ct = call i1 @recipe.one($t $cd, $t $z)\n$v = select i1 $ct, $t $ye, $t $no"); push!(st, v)
+		elseif op == 12
+			k = int(abs(a), "nearest count"); k <= 0 && bad("nearest count", a); ex = a < 0
+			rw = x.parameters ÷ (F + 1); (rw == 0 || rw * (F + 1) != x.parameters) && bad("nearest table width", x.parameters)
+			p = "$P.nearest.$q"; q += 1; mx = L(floatmax(), t)
+			w("br label %$p.entry\n$p.entry:\nbr label %$p.head\n$p.head:\n%$p.i = phi i32 [ 0, %$p.entry ], [ %$p.i.next, %$p.latch ]")
+			for j in 0:k-1, (d, e) in (("d", mx), ("t", z)) w("%$p.$d$j = phi $t [ $e, %$p.entry ], [ %$p.$d$j.new, %$p.latch ]") end
+			w("%$p.more = icmp ult i32 %$p.i, $rw\nbr i1 %$p.more, label %$p.distance, label %$p.done\n$p.distance:\nbr label %$p.d.head\n$p.d.head:")
+			w("%$p.j = phi i32 [ 0, %$p.distance ], [ %$p.j.next, %$p.d.body ]\n%$p.acc = phi $t [ $z, %$p.distance ], [ %$p.acc.next, %$p.d.body ]")
+			w("%$p.d.more = icmp ult i32 %$p.j, $F\nbr i1 %$p.d.more, label %$p.d.body, label %$p.d.done\n$p.d.body:\n" * qr(p, "j"))
+			w("%$p.w.base = mul i32 %$p.i, $F\n%$p.w.relative = add i32 %$p.w.base, %$p.j\n%$p.w.index = add i32 %$p.w.relative, $Of\n" * ld(p, "w"))
+			w("%$p.diff = call $t @recipe.sub($t %$p.q, $t %$p.w)\n%$p.square = call $t @recipe.mul($t %$p.diff, $t %$p.diff)\n%$p.acc.next = call $t @recipe.add($t %$p.acc, $t %$p.square)")
+			w("%$p.j.next = add i32 %$p.j, 1\nbr label %$p.d.head\n$p.d.done:")
+			ex && w("%$p.self = icmp eq i32 %$p.i, $R\n%$p.candidate = select i1 %$p.self, $t $mx, $t %$p.acc")
+			cd, ct = ex ? "%$p.candidate" : "%$p.acc", "%$p.target"
+			w("%$p.target.relative = add i32 $(rw * F), %$p.i\n%$p.target.index = add i32 %$p.target.relative, $Of\n" * ld(p, "target"))
+			for j in 0:k-1
+				s = "%$p.swap$j"; D, T = "%$p.d$j", "%$p.t$j"
+				w("$s = call i1 @recipe.ogt($t $D, $t $cd)\n$D.new = select i1 $s, $t $cd, $t $D\n$T.new = select i1 $s, $t $ct, $t $T\n%$p.carry.d$j = select i1 $s, $t $D, $t $cd\n%$p.carry.t$j = select i1 $s, $t $T, $t $ct")
+				cd, ct = "%$p.carry.d$j", "%$p.carry.t$j"
+			end
+			w("br label %$p.latch\n$p.latch:\n%$p.i.next = add i32 %$p.i, 1\nbr label %$p.head\n$p.done:")
+			sm = z
+			for j in 0:k-1 sm = B(o, t, "%$p.sum$j", "add", sm, "%$p.t$j") end
+			w("%$p.result = call $t @recipe.div($t $sm, $t $(L(Float64(k), t)))"); push!(st, "%$p.result")
+		else
+			(F == 0 || x.parameters != 3F) && bad("affine table width", x.parameters)
+			p = "$P.affine.$q"; q += 1
+			w("br label %$p.entry\n$p.entry:\nbr label %$p.head\n$p.head:\n%$p.j = phi i32 [ 0, %$p.entry ], [ %$p.j.next, %$p.body ]\n%$p.acc = phi $t [ $z, %$p.entry ], [ %$p.acc.next, %$p.body ]")
+			w("%$p.more = icmp ult i32 %$p.j, $F\nbr i1 %$p.more, label %$p.body, label %$p.done\n$p.body:\n" * qr(p, "j"))
+			w("%$p.mean.ptr = getelementptr inbounds $t, $pt $W, i32 %$p.j\n%$p.mean = load $t, $pt %$p.mean.ptr, align $al")
+			w("%$p.scale.index = add i32 %$p.j, $F\n" * ld(p, "scale") * "\n%$p.weight.index = add i32 %$p.scale.index, $F\n" * ld(p, "weight"))
+			w("%$p.centered = call $t @recipe.sub($t %$p.q, $t %$p.mean)\n%$p.scaled = call $t @recipe.mul($t %$p.centered, $t %$p.scale)\n%$p.term = call $t @recipe.mul($t %$p.scaled, $t %$p.weight)\n%$p.acc.next = call $t @recipe.add($t %$p.acc, $t %$p.term)")
+			w("%$p.j.next = add i32 %$p.j, 1\nbr label %$p.head\n$p.done:"); push!(st, "%$p.acc")
+		end
+	end
+	length(st) == 1 || err("predictor program ends at stack depth $(length(st))")
+	PredictorForward(String(take!(o)), st[1])
+end
+# Shared head of emit_normalize / emit_normalize_reverse: row, local, position, group, groups, scale.index under base b; rb = layer row base name.
+function nhead(o, b, x, e, rb)
+	E, N = x.channels * x.length, x.length
+	println(o, "$(b)row = udiv i32 $e, $E\n$(b)local = urem i32 $e, $E\n$(b)position = urem i32 $(b)local, $N")
+	x.mode in (MBatch, MEvaluation) ? println(o, "$(b)channel = udiv i32 $(b)local, $N\n$(b)group = add i32 $(b)channel, 0\n$(b)groups = add i32 0, $(x.channels)") :
+		println(o, "$rb = mul i32 $(b)row, $N\n$(b)group = add i32 $rb, $(b)position\n$(b)groups = mul i32 $(x.rows), $N")
+	println(o, "$(b)scale.index = add i32 $(b)groups, $(b)group")
+end
+gep(x, n, i) = "$n = getelementptr inbounds $(x.value_type), $(x.pointer_type) $(x.context), i32 $i"
+lod(x, n, p=n * ".ptr") = "$n = load $(x.value_type), $(x.pointer_type) $p, align $(x.alignment)"
+function Recipe.emit_normalize(x::NormalizeContext, e)
+	o = IOBuffer(); b = "%$(x.prefix).normalize."; t = x.value_type; nhead(o, b, x, e, b * "layer.row.base")
+	println(o, gep(x, b * "mean.ptr", b * "group"), "\n", gep(x, b * "scale.ptr", b * "scale.index"), "\n", lod(x, b * "mean"), "\n", lod(x, b * "scale"))
+	println(o, "$(b)centered = call $t @recipe.sub($t $(x.source_value), $t $(b)mean)\n$(b)value = call $t @recipe.mul($t $(b)centered, $t $(b)scale)")
+	NormalizeFragment(String(take!(o)), b * "value")
+end
+function Recipe.emit_normalize_reverse_stats(x::NormalizeReverseContext, d, ov)
+	m = x.mode; m == MEvaluation && return ""
+	o = IOBuffer(); p = x.prefix; P = "%$p"; g = "$P.group"; gs = "$P.groups"; it = "$P.items"; N = x.length; t, S, Z, pt, al = x.value_type, x.state_type, x.state_zero, x.pointer_type, x.alignment
+	w(s) = println(o, s)
+	rl = "mul i32 $(x.rows), $N"
+	m == MBatch ? w("$gs = add i32 0, $(x.channels)\n$it = $rl") : w("$gs = $rl\n$it = add i32 0, $(x.channels)")
+	w("br label $P.entry\n$p.entry:\nbr label $P.group.loop\n$p.group.loop:\n$g = phi i32 [ %tid, $P.entry ], [ $P.group.next, $P.store ]\n$P.group.more = icmp ult i32 $g, $gs\nbr i1 $P.group.more, label $P.item.loop, label $P.done")
+	w("$p.item.loop:\n$P.p = phi i32 [ 0, $P.group.loop ], [ $P.p.next, $P.item.step ]")
+	for v in ("sum", "projected") w("$P.$v = phi $S [ $Z, $P.group.loop ], [ $P.$v.next, $P.item.step ]") end
+	w("$P.item.more = icmp ult i32 $P.p, $it\nbr i1 $P.item.more, label $P.item.step, label $P.store\n$p.item.step:")
+	a, c = m == MBatch ? ("$P.p", g) : (g, "$P.p")
+	w("$P.row = udiv i32 $a, $N\n$P.position = urem i32 $a, $N\n$P.row.base = mul i32 $P.row, $(x.channels * N)\n$P.channel.base = mul i32 $c, $N")
+	w("$P.local = add i32 $P.channel.base, $P.position\n$P.index = add i32 $P.row.base, $P.local")
+	w("$P.delta.ptr = getelementptr inbounds $t, $pt $d, i32 $P.index\n$P.output.ptr = getelementptr inbounds $t, $pt $ov, i32 $P.index")
+	w("$P.delta.model = load $t, $pt $P.delta.ptr, align $al\n$P.output.model = load $t, $pt $P.output.ptr, align $al")
+	w("$P.delta = call $S @recipe.state.from.model($t $P.delta.model)\n$P.output = call $S @recipe.state.from.model($t $P.output.model)")
+	w("$P.sum.next = call $S @recipe.state.add($S $P.sum, $S $(m == MRms ? Z : "$P.delta"))")
+	w("$P.projection = call $S @recipe.state.mul($S $P.delta, $S $P.output)\n$P.projected.next = call $S @recipe.state.add($S $P.projected, $S $P.projection)")
+	w("$P.p.next = add i32 $P.p, 1\nbr label $P.item.loop\n$p.store:\n$P.items.value = call $S @recipe.state.from.u32(i32 $it)")
+	for v in ("sum", "projected") w("$P.$v.mean = call $S @recipe.state.div($S $P.$v, $S $P.items.value)") end
+	for v in ("sum", "projected") w("$P.$v.model = call $t @recipe.model.from.state($S $P.$v.mean)") end
+	w("$P.sum.base = mul i32 $gs, 2\n$P.projected.base = mul i32 $gs, 3\n$P.sum.index = add i32 $P.sum.base, $g\n$P.projected.index = add i32 $P.projected.base, $g")
+	for v in ("sum", "projected") w(gep(x, "$P.$v.ptr", "$P.$v.index")) end
+	for v in ("sum", "projected") w("store $t $P.$v.model, $pt $P.$v.ptr, align $al") end
+	w("$g.next = add i32 $g, %threads\nbr label $P.group.loop\n$p.done:")
+	String(take!(o))
+end
+function Recipe.emit_normalize_reverse(x::NormalizeReverseContext, e, d, ov)
+	o = IOBuffer(); b = "%$(x.prefix).normalize.reverse."; t = x.value_type; nhead(o, b, x, e, b * "row.base")
+	println(o, "$(b)sum.base = mul i32 $(b)groups, 2\n$(b)projected.base = mul i32 $(b)groups, 3\n$(b)sum.index = add i32 $(b)sum.base, $(b)group\n$(b)projected.index = add i32 $(b)projected.base, $(b)group")
+	for v in ("scale", "sum", "projected") println(o, gep(x, "$b$v.ptr", "$b$v.index")) end
+	println(o, lod(x, b * "scale"))
+	x.mode == MEvaluation && (println(o, "$(b)fixed = call $t @recipe.mul($t $d, $t $(b)scale)"); return NormalizeReverseFragment(String(take!(o)), b * "fixed"))
+	println(o, lod(x, b * "sum"), "\n", lod(x, b * "projected"))
+	println(o, "$(b)output.projection = call $t @recipe.mul($t $ov, $t $(b)projected)\n$(b)centered = call $t @recipe.sub($t $d, $t $(b)sum)")
+	println(o, "$(b)numerator = call $t @recipe.sub($t $(b)centered, $t $(b)output.projection)\n$(b)contribution = call $t @recipe.mul($t $(b)scale, $t $(b)numerator)")
+	NormalizeReverseFragment(String(take!(o)), b * "contribution")
+end
 end
 
 # ==== IRA ====
