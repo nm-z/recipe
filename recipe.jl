@@ -454,6 +454,212 @@ end
 # ==== QIR ====
 @sec QIR begin
 # recipe.rs 2522-3505 (mod quantized): QuantOps, dequant_* over HostQuantOps / NativeQuantOps. Budget 36,000. Parity: IR text, host bits.
+# QuantOps: Int is UInt64 (host) or an SSA name (IR); Value is Float64 or an SSA name. QuantIntOp/QuantValueOp are the Julia
+# functions + - * div rem << >>> & | xor (IR mnemonic from QM). Constant operands may be plain integers in both.
+# Uses stubs pointer_type (IRA), native_literal and alignment (IRB). QUANT and IRB build Recipe.QIR.IqLayout(…) etc.,
+# HostQuantOps(block bytes, 0-based index) and NativeQuantOps(backend, precision), then call dequant_*(ops, …).
+struct HostQuantOps{V<:AbstractVector{UInt8}}; bytes::V; index::Int end
+mutable struct NativeQuantOps; globals::String; ir::String; backend::Backend; precision::NativePrecision; next::Int end
+NativeQuantOps(b::Backend, p::NativePrecision) = NativeQuantOps("", "", b, p, 0)
+"packing ∈ :S :Xs :Xxs"
+struct IqLayout; man::Int; exp::Int; sign::Int; packing::Symbol; table_name::String; table::Vector{UInt16} end
+struct Iq1Layout; man::Int; exp::Int; sign::Int; medium::Bool; table_name::String; table::Vector{UInt16} end
+struct ScalarLayout; sign::Int; exp::Int; man::Int; variant::Int end
+struct Iq4Layout; sign::Int; exp::Int; man::Int; xs::Bool; table_name::String; table::Vector{Int8} end
+const HQ, NQ = HostQuantOps, NativeQuantOps
+const QM = IdDict{Any,String}((+) => "add", (-) => "sub", (*) => "mul", div => "udiv", rem => "urem", (<<) => "shl", (>>>) => "lshr", (&) => "and", (|) => "or", xor => "xor")
+qins(q::NQ, s) = (n = "%quant.$(q.next)"; q.next += 1; q.ir *= "$n = $s\n"; n)
+qty(q::NQ) = q.precision.model_type
+qgep(q::NQ, o) = qins(q, "getelementptr inbounds i8, $(pointer_type(q.backend)) %block, i64 $o")
+qx(q::HQ) = UInt64(q.index); qx(::NQ) = "%local"
+qi(::HQ, f, l, r) = f(l, UInt64(r)); qi(q::NQ, f, l, r) = qins(q, "$(QM[f]) i64 $l, $r")
+"quant_bits"
+qb(q, v, s, w) = qi(q, &, qi(q, >>>, v, s), (UInt64(1) << w) - 1)
+"equal (==) / less (<)"
+qc(::HQ, f, l, r) = UInt64(f(l, r)); qc(q::NQ, f, l, r) = qins(q, "zext i1 $(qins(q, "icmp $(f == (==) ? "eq" : "ult") i64 $l, $r")) to i64")
+"select_int, or select_value when v"
+qs(::HQ, c, y, n, v=false) = c != 0 ? y : n
+qs(q::NQ, c, y, n, v=false) = (t = v ? qty(q) : "i64"; qins(q, "select i1 $(qins(q, "icmp ne i64 $c, 0")), $t $y, $t $n"))
+"sign_extend"
+qe(::HQ, v, b) = reinterpret(UInt64, reinterpret(Int64, v << (64 - b)) >> (64 - b))
+qe(q::NQ, v, b) = qins(q, "sext i$b $(qins(q, "trunc i64 $v to i$b")) to i64")
+"load"
+ql(q::HQ, b, o) = (r = UInt64(0); for k in 0:b÷8-1; r |= UInt64(q.bytes[o+k+1]) << 8k end; r)
+ql(q::NQ, b, o) = (l = qins(q, "load i$b, $(pointer_type(q.backend)) $(qgep(q, o)), align $(b == 8 ? 1 : 2)"); b == 64 ? l : qins(q, "zext i$b $l to i64"))
+"half (w=16) / float (w=32)"
+qF(q::HQ, o, w) = (x = ql(q, w, o); Float64(w == 16 ? reinterpret(Float16, x % UInt16) : reinterpret(Float32, x % UInt32)))
+qF(q::NQ, o, w) = (t = w == 16 ? "half" : "float"; qins(q, "call $(qty(q)) @recipe.from.f$w($t $(qins(q, "load $t, $(pointer_type(q.backend)) $(qgep(q, o)), align $(w ÷ 8)")))"))
+"half_bits"
+qhb(::HQ, b) = Float64(reinterpret(Float16, b % UInt16))
+qhb(q::NQ, b) = qins(q, "call $(qty(q)) @recipe.from.f16(half $(qins(q, "bitcast i16 $(qins(q, "trunc i64 $b to i16")) to half")))")
+"table (UInt16 values) / signed_table (Int8 values)"
+qt(::HQ, n, v, i) = Int64(v[i+1]) % UInt64
+qt(q::NQ, n, v, i) = (s = eltype(v) == Int8; w = s ? 8 : 16; qins(q, "$(s ? 's' : 'z')ext i$w $(qins(q, "load i$w, ptr $(qins(q, "getelementptr inbounds [$(length(v)) x i$w], ptr @recipe_model_$n, i32 0, i64 $i")), align $(w ÷ 8)")) to i64"))
+"value_table"
+qvt(::HQ, n, v, i) = v[i+1]
+function qvt(q::NQ, n, v, i)
+	t = qty(q); g = "@recipe_model_$n"
+	occursin("$g =", q.globals) || (q.globals *= "$g = private unnamed_addr constant [$(length(v)) x $t] [$(join(("$t $(native_literal(q.precision.model, t, x))" for x in v), ", "))]\n")
+	qins(q, "load $t, ptr $(qins(q, "getelementptr inbounds [$(length(v)) x $t], ptr $g, i32 0, i64 $i")), align $(alignment(t))")
+end
+"number"
+qv(::HQ, v, s) = s ? Float64(reinterpret(Int64, v)) : Float64(v)
+qv(q::NQ, v, s) = qins(q, "call $(qty(q)) @recipe.from.$(s ? 's' : 'u')32(i32 $(qins(q, "trunc i64 $v to i32")))")
+"literal"
+qL(::HQ, x) = x; qL(q::NQ, x) = native_literal(q.precision.model, qty(q), x)
+"value"
+qo(::HQ, f, l, r) = f(l, r); qo(q::NQ, f, l, r) = (t = qty(q); qins(q, "call $t @recipe.$(QM[f])($t $l, $t $r)"))
+"signed"
+qsg(::HQ, m, s) = s != 0 ? -m : m
+qsg(q::NQ, m, s) = (t = qty(q); n = qins(q, "call $t @recipe.neg($t $m)"); qins(q, "select i1 $(qins(q, "icmp ne i64 $s, 0")), $t $n, $t $m"))
+"quant_parity_sign"
+function qps(q, s, l)
+	d = qi(q, &, qi(q, >>>, s, l), 1)
+	p = qi(q, xor, s, qi(q, >>>, s, 4)); p = qi(q, xor, p, qi(q, >>>, p, 2)); p = qi(q, xor, p, qi(q, >>>, p, 1)); p = qi(q, &, p, 1)
+	qs(q, qc(q, ==, l, 7), p, d)
+end
+qodd(q, c) = qv(q, qi(q, +, qi(q, *, c, 2), 1), false)
+qfac(q, b, o, e) = (f = ql(q, 8, qi(q, +, qi(q, div, b, 2), o)); qb(q, f, qi(q, *, qi(q, rem, b, 2), e), e))
+const QUNREACHABLE = "internal error: entered unreachable code"
+
+function Recipe.dequant_iq(q, L::IqLayout)
+	x = qx(q); ln = qi(q, rem, x, 8); sc = qF(q, 0, 16); m, p = L.man, L.packing
+	if m == 2 && p == :S
+		vb = qi(q, div, x, 16); sl = qi(q, div, x, 8); lo = ql(q, 8, qi(q, +, sl, 2))
+		h = ql(q, 8, qi(q, +, qi(q, div, sl, 4), 66)); h = qi(q, <<, qb(q, h, qi(q, *, qi(q, rem, sl, 4), 2), 2), 8)
+		g = qi(q, |, lo, h); sg = qb(q, ql(q, 8, qi(q, +, sl, 34)), ln, L.sign)
+		fc = qfac(q, vb, 74, L.exp); tl, mu, od = ln, 0.25, false
+	elseif m == 2 && p == :Xs
+		vb = qi(q, div, x, 16); sl = qi(q, div, x, 8)
+		w = ql(q, 16, qi(q, +, qi(q, *, sl, 2), 2)); g = qi(q, &, w, 511)
+		sg = qps(q, qi(q, >>>, w, 9), ln); fc = qfac(q, vb, 66, L.exp); tl, mu, od = ln, 0.25, false
+	elseif m in (2, 3) && p == :Xxs
+		vb = qi(q, div, x, 32); gr = qi(q, div, qi(q, rem, x, 32), 8); gb = qi(q, *, vb, 8)
+		gg = m == 2 ? gr : (a = qi(q, *, gr, 2); qi(q, +, a, qi(q, div, ln, 4)))
+		g = ql(q, 8, qi(q, +, qi(q, +, gb, gg), 2))
+		w = ql(q, 32, qi(q, +, qi(q, *, vb, m == 2 ? 8 : 4), m == 2 ? 6 : 66))
+		sg = qps(q, qb(q, w, qi(q, *, gr, 7), 7), ln); fc = qb(q, w, 28, L.exp)
+		tl = m == 2 ? ln : qi(q, rem, ln, 4); mu, od = m == 2 ? 0.25 : 0.5, false
+	elseif m == 3 && p == :S
+		vb = qi(q, div, x, 32); gr = qi(q, div, x, 4); lo = ql(q, 8, qi(q, +, gr, 2))
+		h = ql(q, 8, qi(q, +, qi(q, div, gr, 8), 66)); h = qi(q, <<, qb(q, h, qi(q, rem, gr, 8), 1), 8)
+		g = qi(q, |, lo, h); sg = qb(q, ql(q, 8, qi(q, +, qi(q, div, x, 8), 74)), ln, L.sign)
+		fc = qfac(q, vb, 106, L.exp); tl, mu, od = qi(q, rem, ln, 4), 1.0, true
+	else
+		panic(QUNREACHABLE)
+	end
+	tw = qt(q, L.table_name, L.table, g)
+	ma = qodd(q, qb(q, tw, qi(q, *, tl, m), m))
+	ex = od ? qodd(q, fc) : qo(q, +, qv(q, fc, false), qL(q, 0.5))
+	s = qo(q, *, qo(q, *, sc, ex), qL(q, mu))
+	qsg(q, qo(q, *, s, ma), sg)
+end
+
+function Recipe.dequant_iq1(q, L::Iq1Layout)
+	x = qx(q); ln = qi(q, rem, x, 8)
+	if L.medium
+		vb = qi(q, div, x, 16); gr = qi(q, div, qi(q, rem, x, 16), 8); h = ql(q, 8, qi(q, +, vb, 32))
+		lo = ql(q, 8, qi(q, +, qi(q, *, vb, 2), gr)); gs = qi(q, *, gr, 4)
+		g = qi(q, |, lo, qi(q, <<, qb(q, h, gs, 3), 8)); db = qb(q, h, qi(q, +, gs, 3), L.sign)
+		pk = ql(q, 64, 48); s = qb(q, pk, 12, 4)
+		for (o, w, k) in ((24, 8, 240), (36, 12, 3840), (48, 16, 61440)); s = qi(q, |, s, qi(q, &, qb(q, pk, o, w), k)) end
+		sc = qhb(q, s); sw = qi(q, *, qi(q, div, vb, 4), 16)
+		fc = qb(q, pk, qi(q, +, sw, qi(q, *, qi(q, rem, vb, 4), L.exp)), L.exp)
+	else
+		vb = qi(q, div, x, 32); gr = qi(q, div, qi(q, rem, x, 32), 8); h = ql(q, 16, qi(q, +, qi(q, *, vb, 2), 34))
+		lo = ql(q, 8, qi(q, +, qi(q, +, qi(q, *, vb, 4), 2), gr))
+		g = qi(q, |, lo, qi(q, <<, qb(q, h, qi(q, *, gr, L.exp), 3), 8))
+		db = qb(q, h, 15, L.sign); fc = qb(q, h, 12, L.exp); sc = qF(q, 0, 16)
+	end
+	tw = qt(q, L.table_name, L.table, g)
+	ma = qv(q, qi(q, -, qb(q, tw, qi(q, *, ln, L.man), L.man), 1), true)
+	ma = qo(q, +, ma, qs(q, db, qL(q, -0.125), qL(q, 0.125), true))
+	qo(q, *, qo(q, *, sc, qodd(q, fc)), ma)
+end
+
+function Recipe.dequant_q45k(q, man)
+	x = qx(q); sb = qi(q, div, x, 32); wi = qi(q, rem, x, 32)
+	pk = ql(q, 8, qi(q, +, qi(q, +, qi(q, *, qi(q, div, sb, 2), 32), wi), man == 4 ? 16 : 48))
+	c = qb(q, pk, qi(q, *, qi(q, rem, sb, 2), 4), 4)
+	man == 4 || (h = ql(q, 8, qi(q, +, qi(q, rem, qx(q), 32), 16)); c = qi(q, |, c, qi(q, <<, qb(q, h, qi(q, div, sb, 1), 1), 4)))
+	ls = qi(q, &, ql(q, 8, qi(q, +, sb, 4)), 63); lm = qi(q, &, ql(q, 8, qi(q, +, sb, 8)), 63)
+	hp = ql(q, 8, qi(q, +, sb, 8)); hb = ql(q, 8, sb)
+	a = qi(q, &, hp, 15); hs = qi(q, |, a, qi(q, <<, qi(q, >>>, hb, 6), 4))
+	hm = ql(q, 8, qi(q, +, sb, 4)); a = qi(q, >>>, hp, 4); hm = qi(q, |, a, qi(q, <<, qi(q, >>>, hm, 6), 4))
+	lo = qc(q, <, sb, 4); sc = qs(q, lo, ls, hs); mc = qs(q, lo, lm, hm)
+	s = qF(q, 0, 16); mn = qF(q, 2, 16); sc = qv(q, sc, false); mc = qv(q, mc, false); c = qv(q, c, false)
+	st = qo(q, *, s, sc); b = qo(q, *, mn, mc)
+	qo(q, -, qo(q, *, st, c), b)
+end
+
+function Recipe.dequant_q6k(q)
+	x = qx(q); ch = qi(q, div, x, 128); cl = qi(q, rem, x, 128); gr = qi(q, div, cl, 32); wi = qi(q, rem, cl, 32)
+	a = qi(q, +, wi, qi(q, *, qi(q, &, gr, 1), 32)); lo = ql(q, 8, qi(q, +, qi(q, *, ch, 64), a))
+	h = ql(q, 8, qi(q, +, qi(q, +, qi(q, *, ch, 32), wi), 128))
+	lb = qb(q, lo, qi(q, *, qi(q, div, gr, 2), 4), 4)
+	c = qi(q, -, qi(q, |, lb, qi(q, <<, qb(q, h, qi(q, *, gr, 2), 2), 4)), 32)
+	a = qi(q, div, wi, 16); a = qi(q, +, qi(q, *, gr, 2), a)
+	f = qe(q, ql(q, 8, qi(q, +, qi(q, +, qi(q, *, ch, 8), a), 192)), 8)
+	s = qF(q, 208, 16); f = qv(q, f, true); c = qv(q, c, true)
+	qo(q, *, qo(q, *, s, f), c)
+end
+
+function Recipe.dequant_scalar(q, L::ScalarLayout)
+	x = qx(q); hd = L.variant == 1 ? 4 : 2; m = L.man
+	nib(o) = qb(q, ql(q, 8, qi(q, +, qi(q, rem, x, 16), o)), qi(q, *, qi(q, div, x, 16), 4), 4)
+	c = m == 4 ? nib(hd) : m == 5 ? (a = nib(hd + 4); h = ql(q, 8, qi(q, +, qi(q, div, x, 8), hd)); qi(q, |, a, qi(q, <<, qb(q, h, qi(q, rem, x, 8), 1), 4))) :
+		m == 8 ? ql(q, 8, qi(q, +, x, hd)) : panic(QUNREACHABLE)
+	L.exp == 5 || panic(QUNREACHABLE); s = qF(q, 0, 16)
+	c = m == 8 ? qv(q, qe(q, c, 8), true) : L.variant == 0 ? qv(q, qi(q, -, c, qi(q, <<, 1, m - L.sign)), true) : qv(q, c, false)
+	r = qo(q, *, c, s)
+	L.variant == 1 && m != 8 ? qo(q, +, r, qF(q, 2, 16)) : r
+end
+
+function Recipe.dequant_q2k(q)
+	x = qx(q); o = qi(q, div, x, 16); se = qi(q, div, o, 8); sh = qi(q, *, qi(q, div, qi(q, rem, o, 8), 2), 2)
+	hi = qi(q, rem, o, 2); of = qi(q, rem, x, 16)
+	md = ql(q, 8, qi(q, +, qi(q, +, qi(q, *, se, 8), sh), hi)); sc = qi(q, &, md, 15); mc = qi(q, >>>, md, 4)
+	a = qi(q, *, se, 32); c = ql(q, 8, qi(q, +, qi(q, +, qi(q, +, a, qi(q, *, hi, 16)), of), 16))
+	c = qb(q, c, sh, 2); s = qF(q, 80, 16); mn = qF(q, 82, 16)
+	sc = qv(q, sc, false); mc = qv(q, mc, false); c = qv(q, c, false)
+	a = qo(q, *, qo(q, *, s, sc), c)
+	qo(q, -, a, qo(q, *, mn, mc))
+end
+
+function Recipe.dequant_q3k(q)
+	x = qx(q); b = qi(q, div, x, 16); a = qi(q, -, b, 8); lo = qc(q, <, b, 8)
+	ls = ql(q, 8, qi(q, +, qs(q, lo, b, a), 96)); ls = qb(q, ls, qs(q, lo, 0, 4), 4)
+	hs = ql(q, 8, qi(q, +, qi(q, rem, b, 4), 104)); hs = qb(q, hs, qi(q, *, qi(q, div, b, 4), 2), 2)
+	sc = qi(q, -, qi(q, |, ls, qi(q, <<, hs, 4)), 32)
+	a = qi(q, *, qi(q, div, x, 128), 32); wi = qi(q, rem, x, 32)
+	c = ql(q, 8, qi(q, +, qi(q, +, a, wi), 32)); c = qb(q, c, qi(q, *, qi(q, div, qi(q, rem, x, 128), 32), 2), 2)
+	sg = qb(q, ql(q, 8, wi), qi(q, div, x, 32), 1); c = qi(q, -, c, qs(q, sg, 0, 4))
+	s = qF(q, 108, 16); sc = qv(q, sc, true); c = qv(q, c, true)
+	qo(q, *, qo(q, *, s, sc), c)
+end
+
+Recipe.dequant_q8k(q) = (c = qv(q, qe(q, ql(q, 8, qi(q, +, qx(q), 4)), 8), true); qo(q, *, qF(q, 0, 32), c))
+
+function Recipe.dequant_iq4(q, L::Iq4Layout)
+	x = qx(q); s = qF(q, 0, 16); m = L.man
+	if L.xs
+		b = qi(q, div, x, 32); h = ql(q, 16, 2)
+		lo = ql(q, 8, qi(q, +, qi(q, div, b, 2), 4)); lo = qb(q, lo, qi(q, *, qi(q, rem, b, 2), 4), m)
+		h = qi(q, <<, qb(q, h, qi(q, *, b, 2), L.sign + 1), m)
+		e = qi(q, -, qi(q, |, lo, h), 1 << (L.exp - 1))
+		pk = ql(q, 8, qi(q, +, qi(q, +, qi(q, *, b, 16), qi(q, rem, x, 16)), 8))
+		c = qb(q, pk, qs(q, qc(q, <, qi(q, rem, x, 32), 16), 0, 4), m)
+	else
+		pk = ql(q, 8, qi(q, +, qi(q, rem, x, 16), 2)); c = qb(q, pk, qs(q, qc(q, <, x, 16), 0, 4), m); e = 1
+	end
+	l = qv(q, qt(q, L.table_name, L.table, c), true); e = qv(q, e, true)
+	qo(q, *, qo(q, *, s, e), l)
+end
+
+function Recipe.dequant_nf4(q, bl, tn, t, sn, s)
+	x = qx(q); p = ql(q, 8, qi(q, div, x, 2)); c = qb(q, p, qi(q, *, qi(q, rem, x, 2), 4), 4)
+	l = qvt(q, tn, t, c); qo(q, *, l, qvt(q, sn, s, qi(q, div, x, bl)))
+end
 end
 
 # ==== IRB ====
