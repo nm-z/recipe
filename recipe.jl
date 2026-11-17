@@ -486,6 +486,230 @@ end
 # ==== GRAPH ====
 @sec GRAPH begin
 # recipe.rs 9409-10397, 10588-10642: graph storage, compile, lowering, stored_graph. Budget 28,000. Parity: graph dumps.
+# Uses QUANT valid spec unavailable encode selection tensor, GPU narrow, ML surrogate_model graph_inputs fit_surrogate
+# predict_rows (Predictor.program), BUNDLE bundle_artifact_key. Offsets stay 0-based as in Rust; slices add 1.
+"Operation::name."
+oname(o::Operation) = o.kind == :estimator ? o.est.name : o.kind == :attention ? "attn" : o.kind == :perceptron ? "perc" : string(o.kind)
+rg(n::Node) = n.offset+1:n.offset+n.parameters
+function Recipe.encode_graph_storage(g::Graph, c::Config)
+	require(length(g.stored) == length(g.nodes), "model graph storage spans are incomplete")
+	for (i, n) in enumerate(g.nodes)
+		(n.parameters == 0 || n.argument[9] == 0) && (g.stored[i] = nothing; continue)
+		f = StorageFormat(rs(UInt16, n.argument[9])); spec(f) === nothing && throw(unavailable(f))
+		r, v = rg(n), g.state.variances
+		g.stored[i] = encode(f, g.parameters[r], length(v) >= last(r) && any(>(0), v[r]) ? v[r] : ones(n.parameters), c)
+	end
+end
+function Recipe.compile(m::Model, d::Prepared, t, rows, gpu, c::Config, init::Bool)
+	B = m._blocks; nb = length(B); require(nb > 0, "model must contain a block")
+	for b in B; f = StorageFormat(b.quantization); f.code != 0 && !valid(f) && throw(unavailable(f)) end
+	g = Graph(B[1].operation.kind in (:conv, :pool) ? something(d.sequence, Shape(1, d.features)) : Shape(d.features, 1))
+	for (i, b) in enumerate(B)
+		g.block_index = i - 1; g.block_kind = oname(b.operation); lower_block(g, b, nb, d, t, rows, gpu, c)
+	end
+	q = m._quantization; pf = B[end].profile ? StorageFormat(B[end].quantization) : nothing
+	if g.output.channels != d.target_width || g.output.length != 1
+		lconv(g, d.target_width, g.output.length); q != 0 && (g.nodes[end].argument[9] = q)
+		pf = selection(StorageFormat(q)) === nothing ? nothing : StorageFormat(q)
+	end
+	if pf !== nothing
+		i = findlast(n -> n.parameters != 0 && n.block_index + 1 == nb, g.nodes)
+		i === nothing || (g.nodes[i].argument[9] = tensor(pf, 0x00, false, true))
+	end
+	if init
+		initialize_graph(g, c); o = output_bias_offset(g)
+		o === nothing || (g.parameters[o+1] = ssum(d.targets[1:rows]) / rows)
+	end
+	encode_graph_storage(g, c); g
+end
+function Recipe.materialize_saved_graph(s::SemanticGraph, x, gpu, c::Config)
+	o, ip = s.output, s.input; T = s.tensors
+	p = Prepared(collect(Float64, x), zeros(elements(o)), max(elements(o), 1), 1, 1, elements(ip), DataSchema(), ip.length > 1 ? ip : nothing,
+		false, copy(s.norm_mean), copy(s.norm_scale), UInt64[], copy(s.predictors))
+	g = compile(s.model, p, p.targets, 1, gpu, c, false)
+	require(g.input == ip, "saved semantic input shape does not match the compiled model")
+	require(g.output == o, "saved semantic output shape does not match the compiled model")
+	require(length(g.parameters) == sum(e -> e.count, T; init=0), "saved semantic weights do not match the compiled model")
+	k = 0
+	for (i, n) in enumerate(g.nodes)
+		n.parameters == 0 && continue
+		k < length(T) || err("saved semantic tensor is absent"); e = T[k+=1]
+		require(e.count == n.parameters, "saved semantic tensor has the wrong shape")
+		g.parameters[rg(n)] = e.arithmetic; i <= length(g.stored) && (g.stored[i] = e.format.code != 0 ? deepcopy(e) : nothing)
+	end
+	require(k == length(T), "saved semantic tensors are incomplete")
+	g.frozen = copy(s.frozen); g.state = deepcopy(s.state); g
+end
+function Recipe.append_graph(g::Graph, p::Graph)
+	s, nb, wb, pb = g.source, narrow(length(g.nodes), "model graph nodes"), length(g.parameters), length(g.programs)
+	for n in p.nodes
+		n.source = n.source < 0 ? s : n.source + nb; n.second >= 0 && (n.second += nb)
+		n.offset = checked_add(n.offset, wb, "model weight offset")
+		n.program_count != 0 && (n.program_offset = checked_add(n.program_offset, pb, "model program offset"))
+	end
+	for f in (:parameters, :frozen, :programs, :stored, :nodes); append!(getfield(g, f), getfield(p, f)) end
+	g.output = p.output; g.source = narrow(length(g.nodes), "model graph nodes") - 1
+end
+function Recipe.lower_block(g::Graph, b::Block, total, d, t, rows, gpu, c::Config)
+	sk, f1, o = g.source, length(g.nodes), b.operation; k = o.kind
+	k in (:layer, :perceptron) ? lproj(g, o.a) : k == :conv ? lconv(g, o.a, o.b) : k == :pool ? lpool(g, o.a) :
+	k == :attention ? lattn(g, o.a) : k == :rnn ? lscan(g, o.a, 1) : k == :gru ? lscan(g, o.a, 3) : k == :lstm ? lscan(g, o.a, 4) :
+	k == :residual ? lres(g, o.parts, sk, c) : k == :moe ? lmoe(g, o.a, o.parts, c) : (initialize_graph(g, c); lest(g, o.est, d, t, rows, gpu, c))
+	b.activation != ALinear && lact(g, b.activation, c)
+	b.normalization === nothing || pnode(g, PNormalize, g.output, 0, arguments(Int(b.normalization), number("normalization epsilon", MT["normalization-epsilon"])), -2)
+	if b.quantization != 0
+		i, e = g.block_index, total ÷ 8; more = i < e || i >= 7total ÷ 8 || (i - e) % 3 == 2; r = 0
+		for n in g.nodes[f1+1:end]
+			n.parameters == 0 && continue
+			n.argument[9] = b.profile ? tensor(StorageFormat(b.quantization), oname(o) == "attn" ? r % UInt8 : 0x00, more, false) : b.quantization; r += 1
+		end
+	end
+	narrow(checked_mul(rows, elements(g.output), "node batch"), "GPU node batch"); nothing
+end
+function pnode(g, o, out, np, a, sec)
+	s, off = g.source, length(g.parameters); append!(g.parameters, zeros(checked_add(off, np, "model parameters") - off))
+	append!(g.frozen, zeros(UInt8, length(g.parameters) - length(g.frozen)))
+	push!(g.nodes, Node(o, s, sec, g.output, out, off, np, a, 0, 0, g.block_index, g.block_kind)); push!(g.stored, nothing)
+	g.output = out; g.source = length(g.nodes) - 1
+end
+function pprog(g, sec, v, p)
+	po = length(g.programs); append!(g.programs, p.v); pnode(g, PElementwise, g.output, length(v), arguments(0, 0), sec)
+	n = g.nodes[end]; g.parameters[n.offset.+(1:length(v))] = v; n.program_offset = po; n.program_count = length(p.v) ÷ 3
+end
+function ppred(g, p::PredictorProgram)
+	po = length(g.programs); append!(g.programs, p.code); pnode(g, PPredictor, Shape(1, 1), length(p.table), arguments(p.locals, p.stack), -2)
+	n = g.nodes[end]; n.program_offset = po; n.program_count = length(p.code) ÷ 2; g.parameters[rg(n)] = p.table; g.frozen[rg(n)] .= 1
+end
+function lact(g, a, c)
+	if a == ARelu && !isempty(g.nodes)
+		n = g.nodes[end]
+		g.source == length(g.nodes) - 1 && n.op == PContraction && n.argument[2] == 0 && (n.argument[2] = 1.0; return)
+	end
+	a == ALinear && panic("internal error: entered unreachable code")
+	p, x, A = ScalarProgram(), -1.0, c.activation
+	K(v) = constant(p, v); B(o, l, r) = op(p, o, l, r); U(o, v) = unary(p, o, v); M(l, r) = B(SMultiply, l, r)
+	z, o = K(0.0), K(1.0); ps = B(SGreater, x, z)
+	if a == ACos; U(SCos, x)
+	elseif a == AExp || a == ATanh; U(a == AExp ? SExp : STanh, x)
+	elseif a in (ALog, ALn)
+		m = U(SLog, B(SAdd, o, U(SAbsolute, x))); s = choose(p, ps, m, B(SSubtract, z, m))
+		a == ALog && B(SDivide, s, K(2.302585092994046))
+	elseif a == AHuber
+		h = K(A[8]); b = U(SAbsolute, x); l = B(SGreater, b, h); q = M(x, x); f = K(0.5); s = M(f, q)
+		choose(p, l, M(h, B(SSubtract, b, M(f, h))), s)
+	elseif a == ATan; s = U(SSin, x); B(SDivide, s, U(SCos, x))
+	elseif a == ARelu; select(p, ps, x)
+	elseif a in (ALeak, AElu, ASelu, APrelu)
+		n = a == ALeak ? M(K(A[1]), x) : a == APrelu ? M(B(SParameter, 0.0, 0.0), x) :
+			(s = B(SSubtract, U(SExp, select(p, B(SSubtract, o, ps), x)), o); M(K(A[(a == ASelu) + 3]), s))
+		s = choose(p, ps, x, n); a == ASelu && M(K(A[5]), s)
+	elseif a in (ASigmoid, ASilu)
+		f = K(0.5); s = M(f, B(SAdd, U(STanh, M(f, x)), o)); a == ASilu && M(x, s)
+	else
+		u = M(M(x, x), x); u = M(K(A[7]), u); u = B(SAdd, x, u); u = M(K(A[6]), u); u = B(SAdd, o, U(STanh, u)); M(M(K(0.5), x), u)
+	end
+	pprog(g, -2, a == APrelu ? [A[2]] : Float64[], p)
+end
+lproj(g, ch) = (require(ch != 0, "layer width must be positive");
+	pnode(g, PContraction, Shape(ch, g.output.length), checked_add(checked_mul(g.output.channels, ch, "projection matrix"), ch, "projection bias"), zeros(9), -2))
+function lconv(g, f, k)
+	require(f != 0 && k != 0, "convolution dimensions must be positive"); require(k <= g.output.length, "convolution kernel exceeds sequence length")
+	np = checked_add(checked_mul(f, checked_mul(g.output.channels, k, "convolution window"), "conv matrix"), f, "conv bias")
+	pnode(g, PContraction, Shape(f, g.output.length - k + 1), np, arguments(k, 0), -2)
+end
+Recipe.output_bias_offset(g::Graph) = (i = findlast(n -> n.op == PContraction, g.nodes); i === nothing ? nothing : (n = g.nodes[i]; n.offset + n.parameters - n.output.channels))
+lpool(g, s) = (require(s != 0, "pool window must be positive"); pnode(g, PPool, Shape(g.output.channels, cld(g.output.length, s)), 0, arguments(s, 0), -2))
+function lattn(g, h)
+	ip = g.output; require(h != 0 && ip.channels % h == 0, "attention head partition is invalid")
+	lproj(g, checked_mul(ip.channels, 3, "attention QKV projection width")); w = ip.channels ÷ h
+	pnode(g, PAttention, ip, 0, Float64[h, h, w, 0, 0, sqrt(w), 0, 0, 0], -2); lproj(g, ip.channels)
+end
+rst(g, s, sh) = (g.source = s; g.output = sh)
+gp(g, a, b, sh, f, v=Float64[]) = (p = ScalarProgram(); f(p); rst(g, a, sh); pprog(g, b, v, p); g.source)
+bin(g, a, b, sh, o) = gp(g, a, b, sh, p -> op(p, o, -1.0, -2.0))
+gact(g, s, sh, v, c) = (rst(g, s, sh); v != ALinear && lact(g, v, c); g.source)
+"Residual part: layer, conv, or activation (linear skipped unless `lin`, where Rust reaches unreachable!)."
+part(g, v::Residual, c, lin=false) = v.kind == :layer ? lproj(g, v.a) : v.kind == :conv ? lconv(g, v.a, v.b) : (lin || v.act != ALinear) && lact(g, v.act, c)
+function rmask(g, S, j, sh, k)
+	r = gp(g, S[j], -2, sh, p -> constant(p, 0.0))
+	for i in eachindex(S)
+		i == j && continue; h = bin(g, S[i], S[j], sh, SGreater)
+		i < j && (l = bin(g, S[j], S[i], sh, SGreater); u = bin(g, h, l, sh, SAdd); h = bin(g, h, gp(g, u, -2, sh, p -> op(p, SSubtract, constant(p, 1.0), -1.0)), sh, SAdd))
+		r = bin(g, r, h, sh, SAdd)
+	end
+	gp(g, r, -2, sh, p -> op(p, SGreater, constant(p, Float64(k)), -1.0))
+end
+function lmoe(g, k, E, c)
+	require(!isempty(E), "moe requires an expert"); require(k != 0 && k <= length(E), "moe top-k is invalid")
+	s, ip, br, out = g.source, g.output, Int32[], nothing
+	for v in E
+		rst(g, s, ip); part(g, v, c); out === nothing || require(g.output == out, "moe experts must have one output shape")
+		out = g.output; push!(br, g.source)
+	end
+	S = map(E) do _
+		rst(g, s, ip); lproj(g, out.channels); require(g.output == out, "moe router shape does not match its experts"); g.source
+	end
+	m = foldl((a, b) -> gp(g, a, b, out, p -> choose(p, op(p, SGreater, -1.0, -2.0), -1.0, -2.0)), S)
+	W = map(eachindex(S)) do j
+		x = gact(g, bin(g, S[j], m, out, SSubtract), out, AExp, c); bin(g, rmask(g, S, j, out, k), x, out, SMultiply)
+	end
+	dn = foldl((a, b) -> bin(g, a, b, out, SAdd), W); r = nothing
+	for (j, b) in enumerate(br)
+		u = bin(g, bin(g, W[j], dn, out, SDivide), b, out, SMultiply); r = r === nothing ? u : bin(g, r, u, out, SAdd)
+	end
+	rst(g, r, out)
+end
+function lscan(g, ch, n)
+	require(ch != 0, "recurrent width must be positive")
+	i, s = checked_mul(g.output.channels, ch, "scan input matrix"), checked_mul(ch, ch, "scan state matrix")
+	st = checked_add(checked_add(i, s, "scan gate"), ch, "scan bias")
+	pnode(g, PScan, Shape(ch, g.output.length), checked_mul(n, st, "scan parameters"), arguments(n, 0), -2)
+end
+function lres(g, P, sk, c)
+	sh = g.output; require(!isempty(P), "residual branch must contain an operation")
+	for v in P; part(g, v, c, true) end
+	require(g.output == sh, "residual shape mismatch"); pprog(g, sk, Float64[], (p = ScalarProgram(); op(p, SAdd, -1.0, -2.0); p))
+end
+function lest(g, e::Estimator, d, t, rows, gpu, c)
+	s, ip = g.source, g.output; n = elements(ip); np = count(x -> x.op == PPredictor, g.nodes)
+	P(x, y, r, tc) = Prepared(x, y, 1, r, r, n, DataSchema(), nothing, tc, Float64[], Float64[], UInt64[], PredictorProgram[])
+	if np < length(d.fitted)
+		pg = d.fitted[np+1]; b = P(zeros(n), [0.0], 1, false)
+		sg = compile(surrogate_model(c.surrogate_width), b, b.targets, 1, gpu, c, false); fill!(sg.frozen, 1)
+	else
+		e.validate(e.param, rows); x = graph_inputs(g, d.samples, d.targets, rows, gpu, c.precision)
+		q = P(copy(x), t[1:rows], rows, d.target_categorical); y = predict_rows(e.fit(e.param, q, rows, c, true), x, n)
+		pg = e.fit(e.param, q, rows, c, false).program; sg = fit_surrogate(ip, x, y, c.surrogate_width, gpu, c)
+	end
+	rst(g, s, ip); ppred(g, pg); r = g.source; rst(g, s, ip)
+	gp(g, r, append_graph(g, sg), Shape(1, 1), p -> op(p, SStraightThrough, -1.0, -2.0)); nothing
+end
+function Recipe.initialize_graph(g::Graph, c::Config)
+	s, P = c.random_seed % UInt64, g.parameters
+	for n in g.nodes
+		n.op == PElementwise && continue
+		f = c.initial / sqrt(Float64(max(n.parameters ÷ max(n.output.channels, 1), 1)))
+		for i in rg(n)
+			g.frozen[i] == 0 || continue
+			s = s * 0x5851f42d4c957f2d + 0x14057b7ef767814f; P[i] = (Float64(s >> 11) / 9007199254740992.0 * 2 - 1) * f
+		end
+		o, e, ch = n.offset, n.offset + n.parameters, n.output.channels
+		n.op == PContraction && (P[e-ch+1:e] .= 0)
+		if n.op == PScan
+			im, sm = n.input.channels * ch, ch * ch; sd, G = im + sm + ch, rs(Int, n.argument[1])
+			for k in 0:G-1; P[o+k*sd+im+sm+1:o+(k+1)sd] .= 0 end
+			G == 4 && (P[o+sd+im+sm+1:o+2sd] .= 1)
+		end
+	end
+end
+function Recipe.stored_graph(g::Graph, m::Model, d::Data, sc, pr::Compute, tg)
+	a, p = d._autoregressive, d._prepared; ok = p isa Prepared
+	ins = a ? ["char$(i-1).u$(uppercase(string(UInt32(h); base=16, pad=4))).$j" for (i, h) in enumerate(CHAR_IDS) for j in 0:g.input.length-1] :
+		["input$i" for i in 0:elements(g.input)-1]
+	StoredGraph(deepcopy(g), deepcopy(m), pr, ins, a ? ["char-id"] : isempty(d._target) ? ["target"] : copy(d._target),
+		ok ? copy(p.norm_mean) : Float64[], ok ? copy(p.norm_scale) : Float64[], sc === nothing ? 0.0 : sc.minimum, sc === nothing ? 0.0 : sc.span,
+		Float64[], bundle_artifact_key(m, ok ? copy(p.schema) : DataSchema(), pr, g, tg))
+end
 end
 
 # ==== GPU ====
