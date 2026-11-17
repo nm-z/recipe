@@ -459,6 +459,193 @@ end
 # ==== IRB ====
 @sec IRB begin
 # recipe.rs 4114-5234: pointers, quantized decoders, model load, emit, loss/seed, AdamW, loss IR, loops. Budget 36,000. Parity: IR text.
+# IR builders print to an IO; `i` is Rust's 0-based node index. Loop bodies come last: emit_fixed_loop(io, i, name, n, (io, p) -> …).
+# Uses IRA backend_template pointer_type barrier ptr_gep prune_internal_definitions emit_fixed_primitives(m, b, matrix, reverse, training);
+# QUANT spec(::StorageFormat) → nothing | s (s.codec s.block), nf4_codebook, Recipe.QUANT.codec_quantization(codec) → q (q.name q.block
+# q.stride q.native), Recipe.QUANT.native_table(q.native) → nothing | (name, definition), Recipe.QUANT.native_decode(q.native, ops) → value;
+# QIR dequant_nf4, Recipe.QIR.NativeQuantOps(globals, ir, backend, ::NativePrecision, next) with fields globals ir.
+kern(b) = b == Amd ? "protected amdgpu_kernel " : "protected ptx_kernel "
+const TID = "%tid = call i32 @global_id()\n"
+i32c(n, m) = n > typemax(Int32) ? err(m) : n
+"Grid-stride loop head: `x.loop` phi over `v` from `a` (block `f`), back edge from `st`, body label `bd`."
+lp(x, t, a, f, n; nx="next", st="step", bd="step", v="p") =
+	"br label %$x.loop\n$x.loop:\n%$x.$v = phi $t [ $a, %$f ], [ %$x.$nx, %$x.$st ]\n%$x.more = icmp ult $t %$x.$v, $n\nbr i1 %$x.more, label %$x.$bd, label %$x.done\n$x.$bd:\n"
+tl(x; t="i32", s="%threads", nx="next", v="p") = "%$x.$nx = add $t %$x.$v, $s\nbr label %$x.loop\n$x.done:\n"
+bl(x, l) = "br label %$x.$l\n$x.$l:\n"
+hx(v) = "0x" * uppercase(string(reinterpret(UInt64, Float64(v)); base=16, pad=16))
+"State calls, `name op args…` per `;`: op sel → select, o* → i1 compare; bare names get `%X.`. Returns the last value."
+function dsl(io, X, t, s)
+	f(a) = isletter(a[1]) ? "%$X.$a" : a; n = ""
+	for l in split(s, ';')
+		n, o, a... = split(l)
+		print(io, "%$X.$n = ", o == "sel" ? "select i1 $(f(a[1])), $t $(f(a[2])), $t $(f(a[3]))" :
+			"call $(o[1] == 'o' ? "i1" : t) @recipe.state.$o($(join(("$t " * f(x) for x in a), ", ")))", "\n")
+	end
+	"%$X.$n"
+end
+Recipe.type_literal(t, v) = t == "double" ? hx(v) : t == "float" ? hx(Float32(v)) : isinteger(v) ? string(rs(Int64, v)) : fmtd(v)
+Recipe.native_literal(c::Compute, t, v) = t in ("double", "float") ? type_literal(t, v) : t == "half" ? "0xH" * uppercase(string(pack(c, v); base=16, pad=4)) : string(pack(c, v))
+Recipe.integer_argument(v, r) = (require(isfinite(v) && isinteger(v) && typemin(Int32) <= v <= typemax(Int32), "native $r is not an integer"); Int32(v))
+Recipe.normalize_mode(v) = (i = integer_argument(v, "normalization mode"); 0 <= i <= 3 ? NormalizeMode(i) : err("normalization mode is unsupported"))
+Recipe.alignment(t) = t == "double" ? 8 : t in ("float", "i32") ? 4 : t == "i16" ? 2 : 1
+Recipe.loss_threshold(c, t) = native_literal(c, t, Float64(MT["huber-threshold"]))
+Recipe.accumulate_owned(g, v, t, P, x) = (a = alignment(t); "%$x.prior = load $t, $P $g, align $a\n%$x.sum = call $t @recipe.add($t %$x.prior, $t $v)\nstore $t %$x.sum, $P $g, align $a\n")
+foc(p, g, h, o, e) = "probability sigmoid $p;target.class oge $g $h;one.probability sub $o probability;correct.raw sel target.class probability one.probability;correct.low olt correct.raw $e;correct sel correct.low $e correct.raw;incorrect sub $o correct"
+function Recipe.emit_loss_value(io, l::LossFunction, c, t, p, g, th)
+	L(v) = native_literal(c, t, v); o, e, h, k = L(1.0), L(eps()), L(0.5), l.c
+	dsl(io, "loss", t, "difference sub $p $g")
+	dsl(io, "loss", t, k <= 1 ? "scaled div difference normalizer;square mul scaled scaled" :
+		k == 2 ? "square mul difference difference;absolute abs difference;small ole absolute $th;half.square mul square $h;half.threshold mul $th $h;large.base sub absolute half.threshold;large mul $th large.base;huber sel small half.square large" :
+		k == 3 ? "mae abs difference" :
+		k == 4 ? (u = L(below_one(c, 1.0 - eps())); "probability.raw sigmoid $p;probability.low olt probability.raw $e;probability.floor sel probability.low $e probability.raw;probability.high ogt probability.floor $u;probability sel probability.high $u probability.floor;log.probability log probability;one.probability sub $o probability;log.one.probability log one.probability;first mul $g log.probability;one.target sub $o $g;second mul one.target log.one.probability;cross.sum add first second;cross neg cross.sum") :
+		k == 6 ? foc(p, g, h, o, e) * ";incorrect.square mul incorrect incorrect;log.correct log correct;focal.product mul incorrect.square log.correct;focal neg focal.product" :
+		err("native loss $k is unsupported"))
+end
+function Recipe.emit_loss_gradient(io, l::LossFunction, c, t, p, g, th, lv, rows)
+	L(v) = native_literal(c, t, v); z, o, e, h, k = L(0.0), L(1.0), L(eps()), L(0.5), l.c
+	dsl(io, "seed", t, "difference sub $p $g"); print(io, "%seed.rows = call $t @recipe.state.from.u32(i32 $rows)\n")
+	dsl(io, "seed", t, k == 0 ? "twice add difference difference;mse div twice rows" :
+		k == 1 ? "rmse.denominator mul rows $lv;rmse.zero oeq $lv $z;rmse.divided div difference rmse.denominator;rmse sel rmse.zero $z rmse.divided" :
+		k == 2 ? "huber.negative.threshold neg $th;huber.low olt difference huber.negative.threshold;huber.high ogt difference $th;huber.lower sel huber.low huber.negative.threshold difference;huber.clamped sel huber.high $th huber.lower;huber div huber.clamped rows" :
+		k == 3 ? "mae.negative olt difference $z;mae.positive ogt difference $z;mae.upper sel mae.positive $o $z;mae.sign sel mae.negative $(L(-1.0)) mae.upper;mae div mae.sign rows" :
+		k == 4 ? "probability sigmoid $p;cross.difference sub probability $g;cross div cross.difference rows" :
+		k == 6 ? foc(p, g, h, o, e) * ";log.correct log correct;focal.first mul $(L(2.0)) incorrect;focal.first.value mul focal.first log.correct;focal.square mul incorrect incorrect;focal.second div focal.square correct;focal.by.correct sub focal.first.value focal.second;focal.sigmoid.derivative mul probability one.probability;focal.negative.direction neg focal.sigmoid.derivative;focal.direction sel target.class focal.sigmoid.derivative focal.negative.direction;focal.chain mul focal.by.correct focal.direction;focal div focal.chain rows" :
+		err("native loss $k is unsupported"))
+end
+function Recipe.emit_pointers(m::NativeModelIr, b, i, p::NodePlan, r::Bool, io::IO)
+	x, n, L = "n$i", p.node, m.layout
+	g(a, o, s) = (print(io, ptr_gep(b, a, o, "$x.$s")); "%$x.$s")
+	s = n.source >= 0 ? g("values", L.values[n.source+1], "source") : "%samples"
+	d = n.second >= 0 ? g("values", L.values[n.second+1], "second") : s
+	g("values", p.value, "value"); g("contexts", p.context, "context"); r && g("adjoints", p.adjoint, "delta")
+	g("weights", checked_mul(n.offset, bytes(m.precision.model), "native parameter offset"), "weights")
+	a = r && n.source >= 0 ? g("adjoints", L.adjoints[n.source+1], "source.adjoint") : "%input_adjoint"
+	ModelPointers(s, d, "%$x.value", "%$x.context", "%$x.delta", "%$x.weights", a, r && n.second >= 0 ? g("adjoints", L.adjoints[n.second+1], "second.adjoint") : a)
+end
+"Stored weight → (spec, quantization)."
+qf(s) = (p = spec(s.format); p === nothing && err("native quantized format $(Int(s.format.code)) is unavailable"); (p, Recipe.QUANT.codec_quantization(p.codec)))
+nf(q) = q.name == "q4_nf"
+nfc(s) = nf4_codebook(s.codebook, s.count, length(s.bytes))
+function qdef(io, m, b, nm, h, dec)
+	o = Recipe.QIR.NativeQuantOps("", "", b, m.precision, 0); r = dec(o); T = m.precision.model_type
+	print(io, o.globals, "define internal $T @recipe_model_quantized_$nm($(pointer_type(b)) %matrix, i32 %row, i32 %column, i32 %columns) #1 {\nentry:\n", h, o.ir, "ret $T $r\n}\n")
+end
+function qdecs(m, b)
+	io, seen, tabs, P = IOBuffer(), [], [], pointer_type(b)
+	for (i, p) in enumerate(m.plans)
+		s = p.stored; s === nothing && continue
+		c, q = qf(s)
+		if nf(q)
+			k, tb, sc = nfc(s); x = "q4_nf_n$(i-1)"
+			qdef(io, m, b, x, "%block = getelementptr inbounds i8, $P %matrix, i32 0\n%local = zext i32 %column to i64\n", o -> dequant_nf4(o, k, x * "_table", tb, x * "_scales", sc))
+		elseif c.codec ∉ seen
+			t = Recipe.QUANT.native_table(q.native); k = q.block
+			t === nothing || t[1] in tabs || (print(io, t[2]); push!(tabs, t[1]))
+			qdef(io, m, b, q.name, "%blocks = udiv i32 %columns, $k\n%row.base = mul i32 %row, %blocks\n%block.local = udiv i32 %column, $k\n%block.index = add i32 %row.base, %block.local\n%block.offset = mul i32 %block.index, $(q.stride)\n%block = getelementptr inbounds i8, $P %matrix, i32 %block.offset\n%local.i32 = urem i32 %column, $k\n%local = zext i32 %local.i32 to i64\n", o -> Recipe.QUANT.native_decode(q.native, o))
+			push!(seen, c.codec)
+		end
+	end
+	String(take!(io))
+end
+function mload(m, b)
+	m.storage_bytes == 0 && return ""
+	P, T, f, io = pointer_type(b), m.precision.model_type, "entry", IOBuffer()
+	print(io, "define $(kern(b))void @recipe_model_load($P %weights, $P %storage, i32 %threads) #0 {\nentry:\n", TID)
+	for (i, p) in enumerate(m.plans)
+		s = p.stored; s === nothing && continue
+		c, q = qf(s); x = "load.n$(i-1)"
+		nm, k = nf(q) ? ("$(q.name)_n$(i-1)", nfc(s)[1]) : (q.name, c.block)
+		n = i32c(s.count, "native quantized weight count exceeds i32"); w = i32c(cld(n, k) * k, "native quantized block count exceeds i32")
+		print(io, lp(x, "i32", "%tid", f, n), "%$x.storage = getelementptr i8, $P %storage, i32 $(p.storage_offset)\n%$x.index = add i32 %$x.p, $(p.node.offset)\n%$x.weights = getelementptr $T, $P %weights, i32 %$x.index\n%$x.value = call $T @recipe_model_quantized_$nm($P %$x.storage, i32 0, i32 %$x.p, i32 $w)\nstore $T %$x.value, $P %$x.weights, align $(alignment(T))\n", tl(x), barrier(b))
+		f = "$x.done"
+	end
+	print(io, "ret void\n}\n"); String(take!(io))
+end
+"NativeModelIr::emit(backend, matrix, loss) → module IR."
+function Recipe.emit_model(m::NativeModelIr, b, mx, l::LossFunction)
+	s = m.schedule
+	t = foldl((t, (k, v)) -> replace(t, "RECIPE_$k" => string(v)), ("WORKGROUP_SIZE" => s.block, "REGISTER_M" => s.register_m, "REGISTER_N" => s.register_n,
+		"REGISTER_COUNT" => s.register_count, "FRAGMENT_K" => s.fragment_k, "CHUNK_K" => s.chunk_k, "CHUNK_VALUES" => s.chunk_values,
+		"CHUNK_BIAS_VALUES" => s.chunk_bias_values, "SCRATCH_ROW_MASK" => NATIVE_SCRATCH_ROW_VALUES - 1, "SCRATCH_ROW_CLEAR" => -NATIVE_SCRATCH_ROW_VALUES,
+		"GRADIENT_SCRATCH_BASE" => s.scratch_base); init=backend_template(b, m.precision, mx))
+	t *= qdecs(m, b); t *= mload(m, b); x = mx !== nothing
+	fi, ft, rv = (emit_fixed_primitives(m, b, x, r, u) for (r, u) in ((false, false), (false, true), (true, false)))
+	prune_internal_definitions(t * kernels(m, b, l, fi, ft, rv))
+end
+clr(P, a, n, l, f) = (x = "clear.$l"; "%$x.start = zext i32 %tid to i64\n%$x.stride = zext i32 %threads to i64\n" * lp(x, "i64", "%$x.start", f, n) *
+	"%$x.ptr = getelementptr i8, $P %$a, i64 %$x.p\nstore i8 0, $P %$x.ptr, align 1\n" * tl(x; t="i64", s="%$x.stride"))
+"Forward bodies, forward kernel and epoch kernel around the emitted primitives (inference fi, training ft, reverse rv)."
+function kernels(m, b, l, fi, ft, rv)
+	pr = m.precision; P, M, S, B = pointer_type(b), pr.model_type, pr.state_type, bytes(pr.model)
+	fa = "$P %samples, $P %weights, $P %values, $P %contexts, i32 %rows, i32 %threads"
+	h(n) = "define internal void @recipe_model_$(n)_forward_body($fa) #1 {\nentry:\n$TID"
+	gb = checked_mul(length(m.graph.parameters), B, "native gradient clear bytes")
+	ib = checked_mul(checked_mul(m.rows, elements(m.graph.input), "native input clear elements"), B, "native input clear bytes")
+	ea = join([["$P %$a" for a in split("samples targets weights frozen moments variances gradient metrics input_adjoint values contexts adjoints")]
+		"i32 %rows"; "i32 %threads"; ["$S %$a" for a in split("rate beta1 beta2 beta1.power beta2.power epsilon decay")]; "i32 %step"], ", ")
+	io = IOBuffer()
+	print(io, h("inference"), fi, "ret void\n}\n", h("training"), ft, "ret void\n}\n", "define $(kern(b))void @recipe_model_forward($fa) #0 {\nentry:\ncall void @recipe_model_inference_forward_body($fa)\nret void\n}\n",
+		"define $(kern(b))void @recipe_model_epoch($ea) #0 {\nentry:\n$TID", clr(P, "gradient", gb, "gradient", "entry"), clr(P, "adjoints", m.layout.adjoints_bytes, "adjoints", "clear.gradient.done"),
+		clr(P, "input_adjoint", ib, "input", "clear.adjoints.done"), barrier(b), "\ncall void @recipe_model_training_forward_body($fa)\n\n")
+	seed(io, m, b, l, M, pr.state, S, P, alignment(M), alignment(S)); print(io, barrier(b), rv)
+	adamw(io, m, M, pr.state, S, P, alignment(M), alignment(S)); print(io, "ret void\n}\n")
+	String(take!(io))
+end
+fm(M, S, P, ma, a, x) = "%$x.model = load $M, $P %$x.ptr, align $ma\n%$a = call $S @recipe.state.from.model($M %$x.model)\n"
+function seed(io, m, b, l, M, SP, S, P, ma, sa)
+	n = checked_mul(m.rows, elements(m.graph.output), "native loss items")
+	isempty(m.plans) && err("native model has no output node")
+	q, z, k = m.plans[end], native_literal(SP, S, 0.0), l.c
+	ld(x, a) = "%$x.$a.ptr = getelementptr $M, $P %$(a == "target" ? "targets" : "prediction"), i32 %$x.p\n" * fm(M, S, P, ma, "$x.$a", "$x.$a")
+	print(io, "%prediction.base = getelementptr i8, $P %values, i32 $(q.value)\n%prediction = bitcast $P %prediction.base to $P\n%metric.ptr = getelementptr $S, $P %metrics, i32 0\n%loss.leader = icmp eq i32 %tid, 0\nbr i1 %loss.leader, label %loss.entry, label %loss.wait\nloss.entry:\n%loss.items = call $S @recipe.state.from.u32(i32 $n)\n",
+		k <= 1 ? "%loss.normalizer = call $S @recipe.state.sqrt($S %loss.items)\n" : "",
+		"br label %loss.step\nloss.step:\n%loss.p = phi i32 [ 0, %loss.entry ], [ %loss.next, %loss.item ]\n%loss.mean = phi $S [ $z, %loss.entry ], [ %loss.mean.next, %loss.item ]\n%loss.more = icmp ult i32 %loss.p, $n\nbr i1 %loss.more, label %loss.item, label %loss.store\nloss.item:\n",
+		ld("loss", "prediction"), ld("loss", "target"))
+	th = loss_threshold(SP, S); v = emit_loss_value(io, l, SP, S, "%loss.prediction", "%loss.target", th)
+	k > 1 && (v = dsl(io, "loss", S, "contribution div $v items"))
+	print(io, "%loss.mean.next = call $S @recipe.state.add($S %loss.mean, $S $v)\n%loss.next = add i32 %loss.p, 1\nbr label %loss.step\nloss.store:\n%loss.value = call $S @recipe.state.",
+		k == 1 ? "sqrt($S %loss.mean" : "add($S %loss.mean, $S $z", ")\nstore $S %loss.value, $P %metric.ptr, align $sa\nbr label %loss.wait\nloss.wait:\n")
+	k == 1 && print(io, barrier(b), "%loss.value.shared = load $S, $P %metric.ptr, align $sa\n")
+	print(io, "%adjoint.base = getelementptr i8, $P %adjoints, i32 $(q.adjoint)\n%adjoint = bitcast $P %adjoint.base to $P\n", lp("seed", "i32", "%tid", "loss.wait", n), ld("seed", "pred"), ld("seed", "target"))
+	g = emit_loss_gradient(io, l, SP, S, "%seed.pred", "%seed.target", th, k == 1 ? "%loss.value.shared" : z, string(n))
+	print(io, "%seed.model = call $M @recipe.model.from.state($S $g)\n%seed.ptr = getelementptr $M, $P %adjoint, i32 %seed.p\nstore $M %seed.model, $P %seed.ptr, align $ma\n", tl("seed"))
+end
+function adamw(io, m, M, SP, S, P, ma, sa)
+	n = i32c(length(m.graph.parameters), "native parameter count exceeds i32")
+	o, x = native_literal(SP, S, 1.0), "optimizer"
+	print(io, bl(x, "entry"), "%$x.base = add i32 0, %tid\n", lp(x, "i32", "%$x.base", "$x.entry", n; st="advance"),
+		("%$x.$a.ptr = getelementptr $t, $P %$c, i32 %$x.p\n" for (a, t, c) in (("frozen", "i8", "frozen"), ("gradient", M, "gradient"), ("moment", S, "moments"), ("variance", S, "variances"), ("weight", M, "weights")))...,
+		"%$x.frozen.value = load i8, $P %$x.frozen.ptr, align 1\n%$x.is.frozen = icmp ne i8 %$x.frozen.value, 0\nbr i1 %$x.is.frozen, label %$x.advance, label %$x.update\n$x.update:\n",
+		fm(M, S, P, ma, "$x.gradient.value", "$x.gradient"), "%$x.moment.old = load $S, $P %$x.moment.ptr, align $sa\n%$x.variance.old = load $S, $P %$x.variance.ptr, align $sa\n", fm(M, S, P, ma, "$x.weight.value", "$x.weight"))
+	dsl(io, x, S, "one.beta1 sub $o %beta1;one.beta2 sub $o %beta2;moment.part mul %beta1 moment.old;gradient.part mul one.beta1 gradient.value;moment.new add moment.part gradient.part;gradient.square mul gradient.value gradient.value;variance.part mul %beta2 variance.old;gradient.variance mul one.beta2 gradient.square;variance.new add variance.part gradient.variance")
+	print(io, "store $S %$x.moment.new, $P %$x.moment.ptr, align $sa\nstore $S %$x.variance.new, $P %$x.variance.ptr, align $sa\n")
+	dsl(io, x, S, "m.correct sub $o %beta1.power;v.correct sub $o %beta2.power;m.hat div moment.new m.correct;v.hat div variance.new v.correct;root sqrt v.hat;denominator add root %epsilon;direction div m.hat denominator;decay mul %decay weight.value;total add direction decay;change mul %rate total;next.state sub weight.value change")
+	print(io, "%$x.next.weight = call $M @recipe.model.from.state($S %$x.next.state)\nstore $M %$x.next.weight, $P %$x.weight.ptr, align $ma\n", bl(x, "advance"), tl(x))
+end
+function Recipe.emit_partitioned_loop(io::IO, i, nm, s::PartitionedLoop, body)
+	x, t, P, z, G = "n$i.$nm.partition", s.value_type, s.pointer_type, s.zero, s.gradients
+	require(s.partitions != 0 && s.columns != 0, "native partitioned loop is empty")
+	require(all(g[1] < s.columns for g in G), "native partitioned loop parameter is out of range")
+	N(v, r) = i32c(v, "$r exceeds i32")
+	w, e = N(s.count ÷ s.partitions, "native partition span"), N(s.count % s.partitions, "native partition remainder")
+	np, nc, a = N(s.partitions, "native partition count"), N(s.columns, "native partition columns"), alignment(t)
+	print(io, bl(x, "entry"), lp(x, "i32", "%tid", "$x.entry", np; nx="advance", bd="body", v="t"), "%$x.t.plus = add i32 %$x.t, 1\n",
+		("%$x.$k.short = icmp ult i32 %$x.$v, $e\n%$x.$k.extra = select i1 %$x.$k.short, i32 %$x.$v, i32 $e\n%$x.$k.whole = mul i32 %$x.$v, $w\n%$x.$k = add i32 %$x.$k.whole, %$x.$k.extra\n" for (k, v) in (("first", "t"), ("limit", "t.plus")))...,
+		"%$x.row = mul i32 %$x.t, $nc\nbr label %$x.inner\n$x.inner:\n%$x.p = phi i32 [ %$x.first, %$x.body ], [ %$x.p.next, %$x.fold ]\n",
+		("%$x.sum.$q = phi $t [ $z, %$x.body ], [ %$x.sum.$q.next, %$x.fold ]\n" for (q, _) in G)...,
+		"%$x.inner.more = icmp ult i32 %$x.p, %$x.limit\nbr i1 %$x.inner.more, label %$x.inner.body, label %$x.store\n$x.inner.body:\n")
+	body(io, "%$x.p")
+	print(io, bl(x, "fold"), ("%$x.sum.$q.next = call $t @recipe.add($t %$x.sum.$q, $t $v)\n" for (q, v) in G)..., "%$x.p.next = add i32 %$x.p, 1\nbr label %$x.inner\n$x.store:\n")
+	for c in 0:nc-1
+		j = findfirst(g -> g[1] == c, G)
+		print(io, "%$x.index.$c = add i32 %$x.row, $c\n%$x.column.$c = getelementptr inbounds $t, $P $(s.scratch), i32 %$x.index.$c\nstore $t $(j === nothing ? z : "%$x.sum.$(G[j][1])"), $P %$x.column.$c, align $a\n")
+	end
+	print(io, bl(x, "step"), tl(x; nx="advance", v="t"))
+end
+function Recipe.emit_fixed_loop(io::IO, i, nm, n, body)
+	x = "n$i.$nm"; i32c(n, "native $nm loop count exceeds i32")
+	print(io, bl(x, "entry"), lp(x, "i32", "%tid", "$x.entry", n; bd="body")); body(io, "%$x.p"); print(io, bl(x, "step"), tl(x))
+end
 end
 
 # ==== TOOL ====
